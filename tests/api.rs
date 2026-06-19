@@ -1,0 +1,469 @@
+//! End-to-end tests against the axum router. Uses `tower::ServiceExt::oneshot`
+//! to drive the router directly without binding a socket.
+
+use std::sync::Arc;
+use std::sync::atomic::{AtomicUsize, Ordering};
+
+use async_trait::async_trait;
+use axum::body::{Body, to_bytes};
+use axum::http::{Request, StatusCode};
+use studybuddy::api::{self, AppState};
+use studybuddy::llm::{ChunkContext, LlmError, LlmProvider, ProposedCard};
+use studybuddy::model::CardContent;
+use studybuddy::scheduler::Sm2;
+use studybuddy::store::{FileRepository, InMemoryRepository, Repository};
+use tower::ServiceExt;
+use uuid::Uuid;
+
+/// A single-heading note that the chunker turns into exactly one chunk.
+const NOTE: &str = "# Vectors\n\nA vector has both magnitude and direction. \
+Adding two vectors places them tip to tail. The dot product multiplies \
+corresponding components and sums them into a scalar.\n";
+
+/// Same note, but frontmatter-excluded — `ingest_text` yields no chunks.
+const EXCLUDED_NOTE: &str =
+    "---\nstudybuddy:\n  exclude: true\n---\n\n# Vectors\n\nbody text here.\n";
+
+type Respond = Box<dyn Fn(&ChunkContext) -> Result<Vec<ProposedCard>, LlmError> + Send + Sync>;
+
+struct FakeLlmProvider {
+    respond: Respond,
+    calls: AtomicUsize,
+}
+
+impl FakeLlmProvider {
+    fn new(
+        respond: impl Fn(&ChunkContext) -> Result<Vec<ProposedCard>, LlmError> + Send + Sync + 'static,
+    ) -> Self {
+        Self {
+            respond: Box::new(respond),
+            calls: AtomicUsize::new(0),
+        }
+    }
+
+    fn always_one_card() -> Self {
+        Self::new(|_| {
+            Ok(vec![ProposedCard {
+                content: CardContent::Qa {
+                    front: "Q".to_string(),
+                    back: "A".to_string(),
+                },
+                rationale: None,
+            }])
+        })
+    }
+
+    fn calls(&self) -> usize {
+        self.calls.load(Ordering::SeqCst)
+    }
+}
+
+#[async_trait]
+impl LlmProvider for FakeLlmProvider {
+    async fn propose_cards(&self, chunk: &ChunkContext) -> Result<Vec<ProposedCard>, LlmError> {
+        self.calls.fetch_add(1, Ordering::SeqCst);
+        (self.respond)(chunk)
+    }
+}
+
+fn router(llm: Arc<dyn LlmProvider>) -> axum::Router {
+    let store: Arc<dyn Repository> = Arc::new(InMemoryRepository::new());
+    api::router(AppState {
+        llm,
+        store,
+        scheduler: Arc::new(Sm2),
+    })
+}
+
+async fn post_ingest(
+    llm: Arc<dyn LlmProvider>,
+    source_file: &str,
+    content: &str,
+) -> (StatusCode, serde_json::Value) {
+    let body = serde_json::json!({ "source_file": source_file, "content": content }).to_string();
+    let res = router(llm)
+        .oneshot(
+            Request::builder()
+                .method("POST")
+                .uri("/ingest")
+                .header("content-type", "application/json")
+                .body(Body::from(body))
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    let status = res.status();
+    let bytes = to_bytes(res.into_body(), usize::MAX).await.unwrap();
+    let v: serde_json::Value = if bytes.is_empty() {
+        serde_json::Value::Null
+    } else {
+        serde_json::from_slice(&bytes).unwrap()
+    };
+    (status, v)
+}
+
+#[tokio::test]
+async fn health_returns_ok_json() {
+    let llm: Arc<dyn LlmProvider> = Arc::new(FakeLlmProvider::always_one_card());
+    let res = router(llm)
+        .oneshot(
+            Request::builder()
+                .uri("/health")
+                .body(Body::empty())
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    assert_eq!(res.status(), StatusCode::OK);
+
+    let bytes = to_bytes(res.into_body(), usize::MAX).await.unwrap();
+    let v: serde_json::Value = serde_json::from_slice(&bytes).unwrap();
+    assert_eq!(v["status"], "ok");
+}
+
+#[tokio::test]
+async fn ingest_returns_counts_for_pushed_note() {
+    let fake = Arc::new(FakeLlmProvider::always_one_card());
+    let llm: Arc<dyn LlmProvider> = fake.clone();
+    let (status, body) = post_ingest(llm, "vectors.md", NOTE).await;
+    assert_eq!(status, StatusCode::OK);
+
+    let chunks = body["chunks"].as_u64().unwrap() as usize;
+    assert!(chunks > 0);
+    assert_eq!(body["proposed_cards"].as_u64().unwrap() as usize, chunks);
+    assert_eq!(body["failed_chunks"].as_u64().unwrap(), 0);
+    assert_eq!(body["skipped_chunks"].as_u64().unwrap(), 0);
+    assert_eq!(fake.calls(), chunks, "LLM called once per chunk");
+}
+
+#[tokio::test]
+async fn ingest_excluded_note_yields_zero_chunks() {
+    let fake = Arc::new(FakeLlmProvider::always_one_card());
+    let llm: Arc<dyn LlmProvider> = fake.clone();
+    let (status, body) = post_ingest(llm, "ignored.md", EXCLUDED_NOTE).await;
+    assert_eq!(status, StatusCode::OK);
+    assert_eq!(body["chunks"].as_u64().unwrap(), 0);
+    assert_eq!(body["proposed_cards"].as_u64().unwrap(), 0);
+    assert_eq!(fake.calls(), 0, "excluded note contributes no LLM calls");
+}
+
+#[tokio::test]
+async fn ingest_counts_bad_input_as_skipped_not_failed() {
+    let fake = Arc::new(FakeLlmProvider::new(|_| {
+        Err(LlmError::BadInput {
+            reason: "model said no".to_string(),
+        })
+    }));
+    let llm: Arc<dyn LlmProvider> = fake.clone();
+    let (status, body) = post_ingest(llm, "vectors.md", NOTE).await;
+    assert_eq!(status, StatusCode::OK);
+
+    let chunks = body["chunks"].as_u64().unwrap() as usize;
+    assert!(chunks > 0);
+    assert_eq!(body["proposed_cards"].as_u64().unwrap(), 0);
+    assert_eq!(body["failed_chunks"].as_u64().unwrap(), 0);
+    assert_eq!(body["skipped_chunks"].as_u64().unwrap() as usize, chunks);
+}
+
+#[tokio::test]
+async fn ingest_counts_transient_as_failed() {
+    let fake = Arc::new(FakeLlmProvider::new(|_| {
+        Err(LlmError::Transient {
+            reason: "timeout".to_string(),
+            retry_after: None,
+        })
+    }));
+    let llm: Arc<dyn LlmProvider> = fake.clone();
+    let (status, body) = post_ingest(llm, "vectors.md", NOTE).await;
+    assert_eq!(status, StatusCode::OK);
+
+    let chunks = body["chunks"].as_u64().unwrap() as usize;
+    assert!(chunks > 0);
+    assert_eq!(body["proposed_cards"].as_u64().unwrap(), 0);
+    assert_eq!(body["skipped_chunks"].as_u64().unwrap(), 0);
+    assert_eq!(body["failed_chunks"].as_u64().unwrap() as usize, chunks);
+}
+
+#[tokio::test]
+async fn ingest_aborts_on_config_error() {
+    let fake = Arc::new(FakeLlmProvider::new(|_| {
+        Err(LlmError::Config {
+            reason: "unknown model".to_string(),
+        })
+    }));
+    let llm: Arc<dyn LlmProvider> = fake.clone();
+    let (status, body) = post_ingest(llm, "vectors.md", NOTE).await;
+    assert_eq!(status, StatusCode::INTERNAL_SERVER_ERROR);
+    assert!(body["error"].as_str().unwrap().contains("unknown model"));
+    assert_eq!(fake.calls(), 1, "must stop on the first Config error");
+}
+
+#[tokio::test]
+async fn ingest_handles_empty_card_proposals() {
+    let fake = Arc::new(FakeLlmProvider::new(|_| Ok(vec![])));
+    let llm: Arc<dyn LlmProvider> = fake.clone();
+    let (status, body) = post_ingest(llm, "vectors.md", NOTE).await;
+    assert_eq!(status, StatusCode::OK);
+
+    let chunks = body["chunks"].as_u64().unwrap() as usize;
+    assert!(chunks > 0);
+    assert_eq!(body["proposed_cards"].as_u64().unwrap(), 0);
+    assert_eq!(body["failed_chunks"].as_u64().unwrap(), 0);
+    assert_eq!(body["skipped_chunks"].as_u64().unwrap(), 0);
+}
+
+#[tokio::test]
+async fn ingest_rejects_absolute_source_file() {
+    let llm: Arc<dyn LlmProvider> = Arc::new(FakeLlmProvider::always_one_card());
+    let (status, body) = post_ingest(llm, "/etc/passwd", NOTE).await;
+    assert_eq!(status, StatusCode::BAD_REQUEST);
+    assert!(body["error"].is_string());
+}
+
+#[tokio::test]
+async fn ingest_rejects_parent_traversal() {
+    let llm: Arc<dyn LlmProvider> = Arc::new(FakeLlmProvider::always_one_card());
+    let (status, body) = post_ingest(llm, "../secret.md", NOTE).await;
+    assert_eq!(status, StatusCode::BAD_REQUEST);
+    assert!(body["error"].is_string());
+}
+
+// ---- curation + review (shared store across requests) ----
+//
+// `Router` clones its `Arc`'d `AppState`, so building the app once and cloning
+// it per `oneshot` means every request hits the same in-memory store.
+
+/// Send one request against a shared app. A `Null` body becomes an empty body
+/// (for GET / no-body POSTs); anything else is sent as JSON.
+async fn send(
+    app: &axum::Router,
+    method: &str,
+    uri: &str,
+    body: serde_json::Value,
+) -> (StatusCode, serde_json::Value) {
+    let req_body = if body.is_null() {
+        Body::empty()
+    } else {
+        Body::from(body.to_string())
+    };
+    let res = app
+        .clone()
+        .oneshot(
+            Request::builder()
+                .method(method)
+                .uri(uri)
+                .header("content-type", "application/json")
+                .body(req_body)
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    let status = res.status();
+    let bytes = to_bytes(res.into_body(), usize::MAX).await.unwrap();
+    let v: serde_json::Value = if bytes.is_empty() {
+        serde_json::Value::Null
+    } else {
+        serde_json::from_slice(&bytes).unwrap()
+    };
+    (status, v)
+}
+
+fn app_with_one_card() -> axum::Router {
+    router(Arc::new(FakeLlmProvider::always_one_card()))
+}
+
+async fn ingest_one_pending(app: &axum::Router, source_file: &str) -> String {
+    let (status, _) = send(
+        app,
+        "POST",
+        "/ingest",
+        serde_json::json!({ "source_file": source_file, "content": NOTE }),
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK);
+    let (_, body) = send(app, "GET", "/cards/pending", serde_json::Value::Null).await;
+    let cards = body["cards"].as_array().unwrap();
+    assert_eq!(cards.len(), 1, "expected one pending card");
+    cards[0]["id"].as_str().unwrap().to_string()
+}
+
+#[tokio::test]
+async fn full_lifecycle_ingest_curate_review() {
+    let app = app_with_one_card();
+    let id = ingest_one_pending(&app, "vectors.md").await;
+
+    // Pending → not due yet (no SRS state).
+    let (_, due) = send(&app, "GET", "/cards/due", serde_json::Value::Null).await;
+    assert!(due["cards"].as_array().unwrap().is_empty());
+
+    // Accept → leaves pending, due immediately.
+    let (status, _) = send(
+        &app,
+        "POST",
+        &format!("/cards/{id}/accept"),
+        serde_json::Value::Null,
+    )
+    .await;
+    assert_eq!(status, StatusCode::NO_CONTENT);
+    let (_, pending) = send(&app, "GET", "/cards/pending", serde_json::Value::Null).await;
+    assert!(pending["cards"].as_array().unwrap().is_empty());
+    let (_, due) = send(&app, "GET", "/cards/due", serde_json::Value::Null).await;
+    assert_eq!(due["cards"].as_array().unwrap().len(), 1);
+
+    // Review (Good) → schedules forward, leaves the due list.
+    let (status, review) = send(
+        &app,
+        "POST",
+        "/reviews",
+        serde_json::json!({ "card_id": id, "rating": "good" }),
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK);
+    assert_eq!(review["interval_days"].as_u64().unwrap(), 1);
+    let (_, due) = send(&app, "GET", "/cards/due", serde_json::Value::Null).await;
+    assert!(
+        due["cards"].as_array().unwrap().is_empty(),
+        "reviewed card scheduled into the future"
+    );
+}
+
+#[tokio::test]
+async fn patch_edits_pending_then_conflicts_after_accept() {
+    let app = app_with_one_card();
+    let id = ingest_one_pending(&app, "vectors.md").await;
+
+    // Edit the pending card's content.
+    let (status, _) = send(
+        &app,
+        "PATCH",
+        &format!("/cards/{id}"),
+        serde_json::json!({ "content": { "type": "qa", "front": "new front", "back": "new back" } }),
+    )
+    .await;
+    assert_eq!(status, StatusCode::NO_CONTENT);
+    let (_, pending) = send(&app, "GET", "/cards/pending", serde_json::Value::Null).await;
+    assert_eq!(pending["cards"][0]["content"]["front"], "new front");
+
+    // After accept, content edits are rejected with 409.
+    send(
+        &app,
+        "POST",
+        &format!("/cards/{id}/accept"),
+        serde_json::Value::Null,
+    )
+    .await;
+    let (status, _) = send(
+        &app,
+        "PATCH",
+        &format!("/cards/{id}"),
+        serde_json::json!({ "content": { "type": "qa", "front": "x", "back": "y" } }),
+    )
+    .await;
+    assert_eq!(status, StatusCode::CONFLICT);
+}
+
+#[tokio::test]
+async fn reject_removes_card_from_pending() {
+    let app = app_with_one_card();
+    let id = ingest_one_pending(&app, "vectors.md").await;
+
+    let (status, _) = send(
+        &app,
+        "POST",
+        &format!("/cards/{id}/reject"),
+        serde_json::Value::Null,
+    )
+    .await;
+    assert_eq!(status, StatusCode::NO_CONTENT);
+    let (_, pending) = send(&app, "GET", "/cards/pending", serde_json::Value::Null).await;
+    assert!(pending["cards"].as_array().unwrap().is_empty());
+}
+
+#[tokio::test]
+async fn reject_after_accept_removes_card_from_due() {
+    let app = app_with_one_card();
+    let id = ingest_one_pending(&app, "vectors.md").await;
+
+    // Accept (now due), then reject — it must not resurface as due.
+    send(
+        &app,
+        "POST",
+        &format!("/cards/{id}/accept"),
+        serde_json::Value::Null,
+    )
+    .await;
+    let (_, due) = send(&app, "GET", "/cards/due", serde_json::Value::Null).await;
+    assert_eq!(due["cards"].as_array().unwrap().len(), 1);
+
+    let (status, _) = send(
+        &app,
+        "POST",
+        &format!("/cards/{id}/reject"),
+        serde_json::Value::Null,
+    )
+    .await;
+    assert_eq!(status, StatusCode::NO_CONTENT);
+    let (_, due) = send(&app, "GET", "/cards/due", serde_json::Value::Null).await;
+    assert!(
+        due["cards"].as_array().unwrap().is_empty(),
+        "rejected card must not stay due"
+    );
+}
+
+#[tokio::test]
+async fn file_backed_lifecycle_smoke() {
+    // Exercises the real production path — the HTTP layer over `FileRepository`
+    // (not the in-memory double) — end to end against a tempdir. `dir` must
+    // outlive the requests, so it's held for the whole test.
+    let dir = tempfile::TempDir::new().unwrap();
+    let llm: Arc<dyn LlmProvider> = Arc::new(FakeLlmProvider::always_one_card());
+    let store: Arc<dyn Repository> = Arc::new(FileRepository::new(dir.path()));
+    let app = api::router(AppState {
+        llm,
+        store,
+        scheduler: Arc::new(Sm2),
+    });
+
+    // ingest → pending → accept → due → review, all hitting the file store.
+    let id = ingest_one_pending(&app, "vectors.md").await;
+    let (status, _) = send(
+        &app,
+        "POST",
+        &format!("/cards/{id}/accept"),
+        serde_json::Value::Null,
+    )
+    .await;
+    assert_eq!(status, StatusCode::NO_CONTENT);
+    let (_, due) = send(&app, "GET", "/cards/due", serde_json::Value::Null).await;
+    assert_eq!(due["cards"].as_array().unwrap().len(), 1);
+    let (status, review) = send(
+        &app,
+        "POST",
+        "/reviews",
+        serde_json::json!({ "card_id": id, "rating": "good" }),
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK);
+    assert_eq!(review["interval_days"].as_u64().unwrap(), 1);
+
+    // The store actually wrote to disk.
+    assert!(dir.path().join("cards").is_dir(), "card sidecars written");
+    assert!(dir.path().join("state.json").is_file(), "SRS state written");
+    assert!(
+        dir.path().join("reviews.jsonl").is_file(),
+        "review log written"
+    );
+}
+
+#[tokio::test]
+async fn review_unknown_card_is_404() {
+    let app = app_with_one_card();
+    let (status, _) = send(
+        &app,
+        "POST",
+        "/reviews",
+        serde_json::json!({ "card_id": Uuid::new_v4().to_string(), "rating": "good" }),
+    )
+    .await;
+    assert_eq!(status, StatusCode::NOT_FOUND);
+}
