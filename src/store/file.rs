@@ -32,6 +32,10 @@ use crate::scheduler::SchedulerState;
 
 use super::Repository;
 
+/// Extension for the per-note card sidecars; the writer and the directory walk
+/// share it so they stay aligned.
+const SIDECAR_EXT: &str = "json";
+
 /// File-backed store rooted at `root`, the configured server data dir.
 pub struct FileRepository {
     root: PathBuf,
@@ -71,7 +75,7 @@ impl FileRepository {
     /// Note path → `<cards_dir>/<sha256(source_file)>.json`.
     fn sidecar_path(&self, source_file: &str) -> PathBuf {
         self.cards_dir()
-            .join(format!("{}.json", sidecar_name(source_file)))
+            .join(format!("{}.{SIDECAR_EXT}", sidecar_name(source_file)))
     }
 
     fn read_state(&self) -> Result<HashMap<CardId, StateEntry>> {
@@ -156,9 +160,7 @@ impl Repository for FileRepository {
     async fn update_content(&self, card: CardId, content: CardContent) -> Result<()> {
         self.modify_card(card, |c| {
             if c.status != CardStatus::Pending {
-                return Err(AppError::Conflict(format!(
-                    "card {card} is not pending; only pending cards are editable"
-                )));
+                return Err(super::not_pending_err(card));
             }
             c.content = content;
             Ok(())
@@ -273,7 +275,7 @@ fn walk(dir: &Path, out: &mut Vec<PathBuf>) -> Result<()> {
         let path = entry?.path();
         if path.is_dir() {
             walk(&path, out)?;
-        } else if path.extension().and_then(|s| s.to_str()) == Some("json") {
+        } else if path.extension().and_then(|s| s.to_str()) == Some(SIDECAR_EXT) {
             out.push(path);
         }
     }

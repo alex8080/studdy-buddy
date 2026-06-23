@@ -136,7 +136,7 @@ fn collect_sections(body: &str) -> Vec<RawSection> {
     let mut in_code_fence = false;
 
     for line in body.lines() {
-        if line.trim_start().starts_with("```") {
+        if is_fence(line) {
             in_code_fence = !in_code_fence;
             current_body.push_str(line);
             current_body.push('\n');
@@ -275,11 +275,16 @@ fn extract_inline_tags(body: &str) -> Vec<String> {
     tags
 }
 
+/// A line that opens or closes a fenced code block (``` after optional indent).
+fn is_fence(line: &str) -> bool {
+    line.trim_start().starts_with("```")
+}
+
 fn strip_code_regions(text: &str) -> String {
     let mut result = String::with_capacity(text.len());
     let mut in_fence = false;
     for line in text.lines() {
-        if line.trim_start().starts_with("```") {
+        if is_fence(line) {
             in_fence = !in_fence;
             continue;
         }

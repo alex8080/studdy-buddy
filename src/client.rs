@@ -11,8 +11,8 @@ use serde::de::DeserializeOwned;
 
 use crate::model::{Card, CardContent, CardId, Rating};
 use crate::wire::{
-    CardsResponse, IngestRequest, IngestResponse, ReviewRequest, ReviewResponse,
-    UpdateContentRequest,
+    CardsResponse, ERROR_KEY, IngestRequest, IngestResponse, ReviewRequest, ReviewResponse,
+    UpdateContentRequest, path,
 };
 
 /// A handle to a running StudyBuddy server.
@@ -47,7 +47,7 @@ impl Client {
         };
         let resp = self
             .http
-            .post(self.url("/ingest"))
+            .post(self.url(path::INGEST))
             .json(&req)
             .send()
             .await?;
@@ -56,14 +56,14 @@ impl Client {
 
     /// `GET /cards/pending` — cards awaiting curation.
     pub async fn pending(&self) -> Result<Vec<Card>> {
-        let resp = self.http.get(self.url("/cards/pending")).send().await?;
+        let resp = self.http.get(self.url(path::CARDS_PENDING)).send().await?;
         let body: CardsResponse = json_or_err(resp).await?;
         Ok(body.cards)
     }
 
     /// `GET /cards/due` — cards whose `next_due <= now`.
     pub async fn due(&self) -> Result<Vec<Card>> {
-        let resp = self.http.get(self.url("/cards/due")).send().await?;
+        let resp = self.http.get(self.url(path::CARDS_DUE)).send().await?;
         let body: CardsResponse = json_or_err(resp).await?;
         Ok(body.cards)
     }
@@ -105,7 +105,7 @@ impl Client {
         let req = ReviewRequest { card_id, rating };
         let resp = self
             .http
-            .post(self.url("/reviews"))
+            .post(self.url(path::REVIEWS))
             .json(&req)
             .send()
             .await?;
@@ -139,7 +139,11 @@ async fn error_from(status: StatusCode, resp: Response) -> anyhow::Error {
     let body = resp.text().await.unwrap_or_default();
     let msg = serde_json::from_str::<serde_json::Value>(&body)
         .ok()
-        .and_then(|v| v.get("error").and_then(|e| e.as_str()).map(str::to_string))
+        .and_then(|v| {
+            v.get(ERROR_KEY)
+                .and_then(|e| e.as_str())
+                .map(str::to_string)
+        })
         .filter(|s| !s.is_empty())
         .unwrap_or(body);
     anyhow!("server returned {status}: {msg}")

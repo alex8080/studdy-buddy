@@ -13,6 +13,21 @@ use serde::{Deserialize, Serialize};
 
 use crate::model::{Card, CardContent, CardId, Rating};
 
+/// JSON key carrying the message in a non-2xx error body (`{ "error": "..." }`).
+/// Written by the server, read by the client.
+pub const ERROR_KEY: &str = "error";
+
+/// Static endpoint paths, shared by the server router and the client so they
+/// can't drift. Parameterized routes (those with a `{id}` segment) stay inline:
+/// the server uses an axum template, the client a `format!`, so there's no
+/// single literal to share.
+pub mod path {
+    pub const INGEST: &str = "/ingest";
+    pub const CARDS_PENDING: &str = "/cards/pending";
+    pub const CARDS_DUE: &str = "/cards/due";
+    pub const REVIEWS: &str = "/reviews";
+}
+
 /// `POST /ingest` request — one pushed note: its vault-relative path and raw
 /// markdown. The feeder (watcher or CLI) sends these per file; the server
 /// parses, chunks, and proposes.

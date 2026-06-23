@@ -17,9 +17,17 @@ pub use memory::InMemoryRepository;
 use async_trait::async_trait;
 use chrono::{DateTime, Utc};
 
-use crate::error::Result;
+use crate::error::{AppError, Result};
 use crate::model::{Card, CardContent, CardId, CardStatus, Review};
 use crate::scheduler::SchedulerState;
+
+/// The `409 Conflict` returned when a non-`Pending` card is edited. Shared by
+/// both backends so the message can't drift between implementations.
+pub(crate) fn not_pending_err(card: CardId) -> AppError {
+    AppError::Conflict(format!(
+        "card {card} is not pending; only pending cards are editable"
+    ))
+}
 
 /// Storage seam for cards and their review state.
 ///

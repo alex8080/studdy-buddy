@@ -19,8 +19,8 @@ use crate::model::{Card, CardId, CardStatus, Review};
 use crate::scheduler::{Scheduler, SchedulerState};
 use crate::store::Repository;
 use crate::wire::{
-    CardsResponse, IngestRequest, IngestResponse, ReviewRequest, ReviewResponse,
-    UpdateContentRequest,
+    CardsResponse, ERROR_KEY, IngestRequest, IngestResponse, ReviewRequest, ReviewResponse,
+    UpdateContentRequest, path,
 };
 
 #[derive(Clone)]
@@ -33,13 +33,13 @@ pub struct AppState {
 pub fn router(state: AppState) -> Router {
     Router::new()
         .route("/health", get(health))
-        .route("/ingest", post(ingest))
-        .route("/cards/pending", get(cards_pending))
-        .route("/cards/due", get(cards_due))
+        .route(path::INGEST, post(ingest))
+        .route(path::CARDS_PENDING, get(cards_pending))
+        .route(path::CARDS_DUE, get(cards_due))
         .route("/cards/{id}/accept", post(accept_card))
         .route("/cards/{id}/reject", post(reject_card))
         .route("/cards/{id}", patch(patch_card))
-        .route("/reviews", post(post_review))
+        .route(path::REVIEWS, post(post_review))
         .with_state(state)
 }
 
@@ -240,6 +240,6 @@ impl IntoResponse for AppError {
             AppError::BadRequest(s) => (StatusCode::BAD_REQUEST, s),
             AppError::Conflict(s) => (StatusCode::CONFLICT, s),
         };
-        (status, Json(serde_json::json!({ "error": msg }))).into_response()
+        (status, Json(serde_json::json!({ ERROR_KEY: msg }))).into_response()
     }
 }

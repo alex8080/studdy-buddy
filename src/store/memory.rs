@@ -60,9 +60,7 @@ impl Repository for InMemoryRepository {
         let mut inner = self.inner.lock().unwrap();
         let c = inner.cards.get_mut(&card).ok_or(AppError::NotFound)?;
         if c.status != CardStatus::Pending {
-            return Err(AppError::Conflict(format!(
-                "card {card} is not pending; only pending cards are editable"
-            )));
+            return Err(super::not_pending_err(card));
         }
         c.content = content;
         Ok(())

@@ -3,6 +3,11 @@ use serde::{Deserialize, Serialize};
 
 use crate::model::Rating;
 
+/// Ease factor a fresh card starts at (SM-2's canonical default).
+const DEFAULT_EASE: f32 = 2.5;
+/// Lower bound on the ease factor; SM-2 never lets a card get harder than this.
+const MIN_EASE: f32 = 1.3;
+
 #[derive(Debug, Clone, Copy, Serialize, Deserialize)]
 pub struct SchedulerState {
     pub interval_days: u32,
@@ -14,7 +19,7 @@ impl Default for SchedulerState {
     fn default() -> Self {
         Self {
             interval_days: 0,
-            ease: 2.5,
+            ease: DEFAULT_EASE,
             repetitions: 0,
         }
     }
@@ -67,7 +72,7 @@ impl Scheduler for Sm2 {
 
         state.ease = (state.ease
             + (0.1 - (5.0 - recall_quality) * (0.08 + (5.0 - recall_quality) * 0.02)))
-            .max(1.3);
+            .max(MIN_EASE);
 
         let next_due = now + Duration::days(state.interval_days as i64);
         ReviewOutcome { state, next_due }
