@@ -7,9 +7,10 @@ This doc maps the *internal* subsystems: what each one owns, how they're connect
 ## Subsystem map
 
 ```
-   watcher (separate feeder app) ──HTTP push──┐
-   src/bin/watcher.rs + src/watcher.rs         │  POST /ingest { source_file, content }
-                                               ▼
+   sb CLI (src/bin/sb.rs + cli.rs) ───┐
+   watcher (src/bin/watcher.rs)    ───┤ via client.rs (typed reqwest, wire.rs DTOs)
+                                      │  HTTP: POST /ingest { source_file, content }, etc.
+                                      ▼
                                      ┌───────────────────┐
                                      │   api  (axum)     │  src/api.rs
                                      └─────────┬─────────┘
@@ -28,7 +29,7 @@ This doc maps the *internal* subsystems: what each one owns, how they're connect
 Shared by all: `model.rs` (domain types) and `error.rs` (AppError, Result).
 ```
 
-The watcher is a **client** of the HTTP API, not an in-process subsystem: it pushes note content; the server parses, chunks, proposes, and persists. The server never reads the vault filesystem.
+The watcher and the `sb` CLI are **clients** of the HTTP API, not in-process subsystems: they push note content (and, for `sb`, drive curation/review); the server parses, chunks, proposes, and persists. The server never reads the vault filesystem. Both talk to it through the one shared `client.rs`, which speaks the `wire.rs` DTOs the server handlers also use.
 
 Subsystems talk only through explicit interfaces (traits or plain function signatures). Handlers in `api.rs` compose them; nothing else reaches across.
 
@@ -50,7 +51,7 @@ Every other subsystem depends on this.
 
 ### `ingest` (`src/ingest.rs`) — built
 
-Parses one markdown string into `Vec<ChunkContext>` ready for the LLM. Filesystem-free — in the push model the server receives note *content*, never a path, so `ingest` no longer walks directories (that moved to [`watcher`](#watcher--separate-feeder-app-skeleton-only)).
+Parses one markdown string into `Vec<ChunkContext>` ready for the LLM. Filesystem-free — in the push model the server receives note *content*, never a path, so `ingest` no longer walks directories (that moved to [`watcher`](#watcher--separate-feeder-app)).
 
 Public API:
 
@@ -147,12 +148,20 @@ We deliberately do **not** shard SRS state by the user's directory structure. Th
 
 **When a database becomes necessary.** If StudyBuddy grows into a multi-tenant hosted web service, files stop being viable — concurrent tenants, transactional integrity, and indexed cross-user queries demand SQLite or Postgres. Because everything is behind `Repository`, that is a new trait impl, not a rewrite. SQLite is also the natural *local* upgrade if watcher concurrency or review-log size ever outgrows the file backend. Schema migrations become the store's problem then, not now.
 
-### `watcher` — separate feeder app (skeleton only)
+### `client` (`src/client.rs`) + `wire` (`src/wire.rs`) — built
 
-In the push model the watcher is a **standalone client**, not part of the server: it owns the vault filesystem, the server doesn't touch it. It walks/watches a directory and pushes each note's content to `POST /ingest`. This decouples the server from the filesystem (any feeder — watcher, manual upload, CLI — pushes the same way) and is forward-compatible with a hosted mode (clients push; the server has no access to their disks).
+`wire.rs` holds the HTTP request/response DTOs (`IngestRequest`/`IngestResponse`, `CardsResponse`, `ReviewRequest`/`ReviewResponse`, `UpdateContentRequest`) shared by the server handlers and the client, so the contract has one definition and can't drift. `client.rs` is a typed `reqwest` wrapper — one async method per endpoint (`ingest`/`pending`/`due`/`accept`/`reject`/`patch`/`review`), with response/error handling factored into `json_or_err`/`empty_or_err`/`error_from`. It holds no domain logic and is the single place anything talks to the server. Tested with `wiremock` unit tests plus `tests/client.rs` (the lifecycle against a real spawned server — the wire-contract test).
 
-- **`src/watcher.rs`** — the filesystem walking (`ingest_directory`/`ingest_file`), relocated out of the server. The 9 acceptance tests moved to `tests/watcher.rs`.
-- **`src/bin/watcher.rs`** — the feeder **skeleton** binary: walks a dir and reports what it found. Still to build: the per-file HTTP push of `{ source_file, content }`, content-hash change detection (skip unchanged notes), and `notify`-based live watching.
+### `cli` (`src/cli.rs`) + `sb` (`src/bin/sb.rs`) — built
+
+`cli.rs` is the `sb` command logic with injected I/O — `run_push`/`run_review`/`run_curate` each take a `Client` plus reader/writer handles (and `run_curate` an editor closure), so `tests/cli.rs` drives them with `Cursor`/`Vec<u8>` against a spawned server. `src/bin/sb.rs` is the thin clap shell that wires real `stdin`/`stdout` and `$EDITOR`; all logic and tests live in the lib. Like the watcher, it's a pure client over `client.rs` — no domain logic.
+
+### `watcher` — separate feeder app
+
+In the push model the watcher is a **standalone client**, not part of the server: it owns the vault filesystem, the server doesn't touch it. It walks a directory and pushes each note's content to `POST /ingest`. This decouples the server from the filesystem (any feeder — watcher, manual upload, the `sb` CLI — pushes the same way through `client.rs`) and is forward-compatible with a hosted mode (clients push; the server has no access to their disks).
+
+- **`src/watcher.rs`** — the filesystem walking: `ingest_directory`/`ingest_file` (legacy, still chunks locally) plus `discover_notes` (push-model: returns each `.md` note's relative path + raw content, unchunked, for the server to process). 11 acceptance tests in `tests/watcher.rs`.
+- **`src/bin/watcher.rs`** — the feeder binary: `discover_notes` → `Client::ingest` per file, a one-shot full vault sweep. Still to build: content-hash change detection (skip unchanged notes) and `notify`-based live watching.
 - **Reconciliation (still to build):** the server no longer re-walks the disk, so the feeder must report deletions / send a manifest for the server to flag orphans (note deleted) and stale (content changed) against the `(source_file, source_heading)` anchor. Per DESIGN.md, cards are *flagged*, never auto-deleted. This sync protocol is deferred to the real watcher build.
 
 ## Cross-subsystem flows
@@ -172,9 +181,11 @@ Per-endpoint flows live in [api.md](api.md). The main one — `POST /ingest` —
 | model, error | done |
 | scheduler (SM-2) | done |
 | ingest | done — `ingest_text` (content→chunks); 24 unit tests |
-| api | full HTTP surface: `/health`, content-based `POST /ingest`, curation (`/cards/pending`, accept/reject, `PATCH`) + review (`/cards/due`, `POST /reviews`); 13 integration tests |
+| api | full HTTP surface: `/health`, content-based `POST /ingest`, curation (`/cards/pending`, accept/reject, `PATCH`) + review (`/cards/due`, `POST /reviews`); 15 integration tests |
+| wire + client | shared DTOs + typed `reqwest` client; `wiremock` unit tests + `tests/client.rs` lifecycle vs a real spawned server |
+| cli (`sb`) | `push`/`curate`/`review` over the client (injected-I/O logic in `cli.rs`, clap shell in `bin/sb.rs`); `tests/cli.rs` acceptance |
 | llm | trait + types; Ollama provider exists, cloud providers not built |
 | store | `Repository` trait + in-memory (10 unit) + file backend (6 acceptance), sha256 sidecars under the data dir; wired into `AppState` |
-| watcher | feeder skeleton (`src/bin/watcher.rs`) + relocated walkers (`src/watcher.rs`, 9 acceptance tests); HTTP push + reconciliation not yet built |
+| watcher | feeder binary pushes a vault via `Client::ingest` (`discover_notes`); walkers in `src/watcher.rs`, 11 acceptance tests. Change-detection + `notify` live-watching + reconciliation not yet built |
 
-Next planned steps: concrete cloud `LlmProvider` impls (design in [llm.md](llm.md)), then the watcher's HTTP push + reconciliation protocol (the feeder reports deletions/manifests so the server can flag orphans/stale).
+Next planned steps: concrete cloud `LlmProvider` impls (design in [llm.md](llm.md)), then the watcher's change detection + `notify` live-watching + reconciliation protocol (the feeder reports deletions/manifests so the server can flag orphans/stale).

@@ -215,3 +215,29 @@ fn sample_vault_heading_paths_carry_hierarchy() {
         "expected an ancestor-carrying heading path, got {la_headings:?}"
     );
 }
+
+// ---- push-model discovery (discover_notes) ----
+
+#[test]
+fn discover_notes_returns_relative_paths_and_raw_content() {
+    let notes = watcher::discover_notes(&fixtures_dir().join("nested")).expect("discover_notes");
+    let paths: HashSet<String> = notes.iter().map(|(p, _)| p.clone()).collect();
+    assert!(paths.contains("top.md"), "got {paths:?}");
+    assert!(paths.contains("sub/inner.md"), "got {paths:?}");
+
+    // Raw content is returned verbatim — unchunked — for the server to process.
+    let (_, top) = notes.iter().find(|(p, _)| p == "top.md").unwrap();
+    assert!(!top.is_empty(), "expected raw note content");
+}
+
+#[test]
+fn discover_notes_skips_hidden_directories() {
+    let notes =
+        watcher::discover_notes(&fixtures_dir().join("hidden_dirs")).expect("discover_notes");
+    let paths: HashSet<String> = notes.iter().map(|(p, _)| p.clone()).collect();
+    assert_eq!(
+        paths,
+        HashSet::from(["normal.md".to_string()]),
+        "only the non-hidden note should be discovered, got {paths:?}"
+    );
+}

@@ -8,16 +8,20 @@ use axum::{
     response::{IntoResponse, Response},
     routing::{get, patch, post},
 };
-use chrono::{DateTime, Utc};
-use serde::{Deserialize, Serialize};
+use chrono::Utc;
+use serde::Serialize;
 use uuid::Uuid;
 
 use crate::error::AppError;
 use crate::ingest::{ChunkConfig, ingest_text};
-use crate::llm::{LlmError, LlmProvider};
-use crate::model::{Card, CardContent, CardId, CardStatus, Rating, Review};
+use crate::llm::{ChunkContext, LlmError, LlmProvider, ProposedCard};
+use crate::model::{Card, CardId, CardStatus, Review};
 use crate::scheduler::{Scheduler, SchedulerState};
 use crate::store::Repository;
+use crate::wire::{
+    CardsResponse, IngestRequest, IngestResponse, ReviewRequest, ReviewResponse,
+    UpdateContentRequest,
+};
 
 #[derive(Clone)]
 pub struct AppState {
@@ -48,22 +52,6 @@ async fn health() -> Json<Health> {
     Json(Health { status: "ok" })
 }
 
-/// One pushed note: its vault-relative path and raw markdown. The feeder
-/// (watcher) sends these per file; the server parses, chunks, and proposes.
-#[derive(Deserialize)]
-struct IngestRequest {
-    source_file: String,
-    content: String,
-}
-
-#[derive(Serialize)]
-struct IngestResponse {
-    chunks: usize,
-    proposed_cards: usize,
-    failed_chunks: usize,
-    skipped_chunks: usize,
-}
-
 async fn ingest(
     State(state): State<AppState>,
     Json(req): Json<IngestRequest>,
@@ -76,42 +64,13 @@ async fn ingest(
     let mut failed_chunks = 0usize;
     let mut skipped_chunks = 0usize;
     for chunk in &chunks {
-        match state.llm.propose_cards(chunk).await {
-            Ok(proposed) => {
-                proposed_cards += proposed.len();
-                for p in proposed {
-                    cards.push(Card {
-                        id: Uuid::new_v4(),
-                        content: p.content,
-                        source_file: chunk.source_file.clone(),
-                        source_heading: chunk.source_heading.clone(),
-                        tags: chunk.tags.clone(),
-                        status: CardStatus::Pending,
-                        created_at: Utc::now(),
-                    });
-                }
+        match classify_chunk(&*state.llm, chunk).await? {
+            ChunkOutcome::Cards(c) => {
+                proposed_cards += c.len();
+                cards.extend(c);
             }
-            Err(LlmError::Transient { reason, .. }) => {
-                tracing::warn!(
-                    source_file = %chunk.source_file,
-                    source_heading = ?chunk.source_heading,
-                    reason = %reason,
-                    "llm transient failure",
-                );
-                failed_chunks += 1;
-            }
-            Err(LlmError::BadInput { reason }) => {
-                tracing::debug!(
-                    source_file = %chunk.source_file,
-                    source_heading = ?chunk.source_heading,
-                    reason = %reason,
-                    "llm bad input",
-                );
-                skipped_chunks += 1;
-            }
-            Err(LlmError::Config { reason }) => {
-                return Err(AppError::Llm(reason));
-            }
+            ChunkOutcome::Failed => failed_chunks += 1,
+            ChunkOutcome::Skipped => skipped_chunks += 1,
         }
     }
     state.store.save_pending(&cards).await?;
@@ -124,9 +83,58 @@ async fn ingest(
     }))
 }
 
-#[derive(Serialize)]
-struct CardsResponse {
-    cards: Vec<Card>,
+/// What one chunk contributed to an ingest: cards to persist, a transient
+/// failure, or a chunk the LLM declined.
+enum ChunkOutcome {
+    Cards(Vec<Card>),
+    Failed,
+    Skipped,
+}
+
+/// Propose cards for one chunk and classify the result. Owns the LLM error
+/// taxonomy and its logging; a `Config` error is fatal and propagates (aborting
+/// the note), while transient/bad-input failures are absorbed per-chunk.
+async fn classify_chunk(
+    llm: &dyn LlmProvider,
+    chunk: &ChunkContext,
+) -> Result<ChunkOutcome, AppError> {
+    match llm.propose_cards(chunk).await {
+        Ok(proposed) => Ok(ChunkOutcome::Cards(
+            proposed.into_iter().map(|p| card_from(p, chunk)).collect(),
+        )),
+        Err(LlmError::Transient { reason, .. }) => {
+            tracing::warn!(
+                source_file = %chunk.source_file,
+                source_heading = ?chunk.source_heading,
+                reason = %reason,
+                "llm transient failure",
+            );
+            Ok(ChunkOutcome::Failed)
+        }
+        Err(LlmError::BadInput { reason }) => {
+            tracing::debug!(
+                source_file = %chunk.source_file,
+                source_heading = ?chunk.source_heading,
+                reason = %reason,
+                "llm bad input",
+            );
+            Ok(ChunkOutcome::Skipped)
+        }
+        Err(LlmError::Config { reason }) => Err(AppError::Llm(reason)),
+    }
+}
+
+/// Mint a `Pending` card from an LLM proposal, anchored to its source chunk.
+fn card_from(proposed: ProposedCard, chunk: &ChunkContext) -> Card {
+    Card {
+        id: Uuid::new_v4(),
+        content: proposed.content,
+        source_file: chunk.source_file.clone(),
+        source_heading: chunk.source_heading.clone(),
+        tags: chunk.tags.clone(),
+        status: CardStatus::Pending,
+        created_at: Utc::now(),
+    }
 }
 
 /// `GET /cards/pending` — cards awaiting curation.
@@ -167,11 +175,6 @@ async fn reject_card(
     Ok(StatusCode::NO_CONTENT)
 }
 
-#[derive(Deserialize)]
-struct UpdateContentRequest {
-    content: CardContent,
-}
-
 /// `PATCH /cards/{id}` — edit a pending card's content (409 if not pending).
 async fn patch_card(
     State(state): State<AppState>,
@@ -180,18 +183,6 @@ async fn patch_card(
 ) -> Result<StatusCode, AppError> {
     state.store.update_content(id, req.content).await?;
     Ok(StatusCode::NO_CONTENT)
-}
-
-#[derive(Deserialize)]
-struct ReviewRequest {
-    card_id: CardId,
-    rating: Rating,
-}
-
-#[derive(Serialize)]
-struct ReviewResponse {
-    next_due: DateTime<Utc>,
-    interval_days: u32,
 }
 
 /// `POST /reviews` — record a review, advance SRS state, persist both.

@@ -405,10 +405,6 @@ mod tests {
         ingest_text(content, "note.md", &ChunkConfig::default()).unwrap()
     }
 
-    fn word_count(text: &str) -> usize {
-        text.split_whitespace().count()
-    }
-
     // ---- frontmatter & opt-out ----
 
     #[test]

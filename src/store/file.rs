@@ -94,6 +94,23 @@ impl FileRepository {
         }
         Ok(cards)
     }
+
+    /// Find the card by id across the sidecars, apply `f` to it, and persist the
+    /// owning sidecar atomically. Returns `NotFound` if no sidecar holds the card,
+    /// or whatever error `f` returns (without writing).
+    fn modify_card(&self, card: CardId, f: impl FnOnce(&mut Card) -> Result<()>) -> Result<()> {
+        let _guard = self.lock.lock().unwrap();
+        for path in list_sidecar_paths(&self.cards_dir())? {
+            let mut cards = read_cards(&path)?;
+            if let Some(c) = cards.iter_mut().find(|c| c.id == card) {
+                f(c)?;
+                let bytes = serde_json::to_vec_pretty(&cards).map_err(parse_err)?;
+                write_atomic(&path, &bytes)?;
+                return Ok(());
+            }
+        }
+        Err(AppError::NotFound)
+    }
 }
 
 #[async_trait]
@@ -137,36 +154,22 @@ impl Repository for FileRepository {
     }
 
     async fn update_content(&self, card: CardId, content: CardContent) -> Result<()> {
-        let _guard = self.lock.lock().unwrap();
-        for path in list_sidecar_paths(&self.cards_dir())? {
-            let mut cards = read_cards(&path)?;
-            if let Some(c) = cards.iter_mut().find(|c| c.id == card) {
-                if c.status != CardStatus::Pending {
-                    return Err(AppError::Conflict(format!(
-                        "card {card} is not pending; only pending cards are editable"
-                    )));
-                }
-                c.content = content;
-                let bytes = serde_json::to_vec_pretty(&cards).map_err(parse_err)?;
-                write_atomic(&path, &bytes)?;
-                return Ok(());
+        self.modify_card(card, |c| {
+            if c.status != CardStatus::Pending {
+                return Err(AppError::Conflict(format!(
+                    "card {card} is not pending; only pending cards are editable"
+                )));
             }
-        }
-        Err(AppError::NotFound)
+            c.content = content;
+            Ok(())
+        })
     }
 
     async fn set_status(&self, card: CardId, status: CardStatus) -> Result<()> {
-        let _guard = self.lock.lock().unwrap();
-        for path in list_sidecar_paths(&self.cards_dir())? {
-            let mut cards = read_cards(&path)?;
-            if let Some(c) = cards.iter_mut().find(|c| c.id == card) {
-                c.status = status;
-                let bytes = serde_json::to_vec_pretty(&cards).map_err(parse_err)?;
-                write_atomic(&path, &bytes)?;
-                return Ok(());
-            }
-        }
-        Err(AppError::NotFound)
+        self.modify_card(card, |c| {
+            c.status = status;
+            Ok(())
+        })
     }
 
     async fn list_due(&self, now: DateTime<Utc>) -> Result<Vec<Card>> {

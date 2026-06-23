@@ -82,3 +82,45 @@ pub fn ingest_file(path: &Path, config: &ChunkConfig) -> Result<Vec<ChunkContext
     let content = std::fs::read_to_string(path)?;
     ingest::ingest_text(&content, &path.to_string_lossy(), config)
 }
+
+/// Discover every `.md` note under `root` (skipping hidden directories),
+/// returning each note's `root`-relative, forward-slashed path and raw content.
+///
+/// This is the push-model discovery half: unlike [`ingest_directory`] it does
+/// **not** chunk or apply frontmatter exclusion — the server does both when the
+/// content is pushed to `POST /ingest`. Pair it with
+/// [`crate::client::Client::ingest`] for the send half. Change detection and
+/// `notify`-based live watching are still to build.
+pub fn discover_notes(root: &Path) -> Result<Vec<(String, String)>> {
+    let mut out = vec![];
+    let mut queue = vec![root.to_path_buf()];
+    while let Some(dir) = queue.pop() {
+        for entry in dir.read_dir()? {
+            let entry = entry?;
+            let name = entry.file_name();
+            let name = name.to_string_lossy();
+            if name.starts_with('.') {
+                continue;
+            }
+            let ft = entry.file_type()?;
+            if ft.is_dir() {
+                queue.push(entry.path());
+                continue;
+            }
+            if !ft.is_file() || !name.ends_with(".md") {
+                continue;
+            }
+            let abs = entry.path();
+            let content = std::fs::read_to_string(&abs)?;
+            let rel = abs
+                .strip_prefix(root)
+                .unwrap_or(&abs)
+                .components()
+                .map(|c| c.as_os_str().to_string_lossy().into_owned())
+                .collect::<Vec<_>>()
+                .join("/");
+            out.push((rel, content));
+        }
+    }
+    Ok(out)
+}

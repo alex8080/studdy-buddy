@@ -2,11 +2,11 @@
 
 A self-hosted local HTTP server that ingests your markdown notes (Obsidian-compatible), uses an LLM to propose flashcards, lets you curate them, and schedules reviews with spaced repetition. Backend-first: future frontends are clients of the HTTP API.
 
-> **Status:** early implementation. The full HTTP surface is up and tested — `POST /ingest` (push a note → LLM proposes cards), curation (`/cards/pending`, accept/reject, edit), and review (`/cards/due`, `/reviews`) backed by an SM-2 scheduler and a file store. Concrete cloud LLM providers and the watcher's live push/reconciliation are still to come. See [`DESIGN.md`](DESIGN.md) and [`docs/`](docs/).
+> **Status:** early implementation. The full HTTP surface is up and tested — `POST /ingest` (push a note → LLM proposes cards), curation (`/cards/pending`, accept/reject, edit), and review (`/cards/due`, `/reviews`) backed by an SM-2 scheduler and a file store. An `sb` CLI drives all of it (see below), and the `watcher` pushes a vault to the server. Concrete cloud LLM providers and the watcher's change-detection / live-watching are still to come. See [`DESIGN.md`](DESIGN.md) and [`docs/`](docs/).
 
 ## Run the server
 
-There are two binaries (`studybuddy` and `watcher`), so name the one you want:
+There are three binaries — the `studybuddy` server, the `sb` CLI, and the `watcher` feeder — so name the one you want:
 
 ```bash
 cargo run --bin studybuddy
@@ -37,53 +37,37 @@ ollama pull gpt-oss:120b-cloud     # or change the model in src/main.rs
 
 If Ollama isn't up, `/ingest` still returns `200`, but with `proposed_cards: 0` and `failed_chunks > 0` (the per-chunk LLM calls fail as transient).
 
-## Submit a note for card generation
+## Drive it with the `sb` CLI
 
-`POST /ingest` takes the note's **content**, not a path — `{ source_file, content }`. `source_file` is the note's vault-relative path (no leading `/`, no `..`); it becomes the card's source anchor.
-
-Inline content:
+`sb` is a thin client over the HTTP API — the easiest way to use the server day to day, no `curl` or hand-copied UUIDs. It targets `http://127.0.0.1:8080` by default (override with `--server` or `$STUDYBUDDY_SERVER`).
 
 ```bash
-curl -s -X POST localhost:8080/ingest \
-  -H 'content-type: application/json' \
-  -d '{"source_file":"linear-algebra/vectors.md","content":"# Vectors\n\nA vector has both magnitude and direction. The dot product of two vectors multiplies their corresponding components and sums them into a scalar."}'
+# push one note for card generation
+# (its anchor is the path relative to --vault, which defaults to the cwd)
+cargo run --bin sb -- push --vault ./notes ./notes/linear-algebra/vectors.md
+
+# curate the proposals interactively:
+#   [a]ccept · [r]eject · [e]dit (opens $EDITOR on the card JSON) · [s]kip · [q]uit
+cargo run --bin sb -- curate
+
+# run a review session:
+#   shows each question, Enter reveals the answer, then rate 1–4 (again/hard/good/easy)
+cargo run --bin sb -- review
 ```
 
-From a file on disk (use `jq` to JSON-encode the content safely):
+Tip: `cargo install --path . --bin sb` puts `sb` on your `PATH`, so you can drop the `cargo run --bin sb --` prefix.
+
+To push a whole vault at once, use the `watcher` (below). For the raw HTTP contract behind each command — request/response shapes, status codes, and per-endpoint flows — see [`docs/api.md`](docs/api.md).
+
+## Push a whole vault with the watcher
+
+`cargo run --bin watcher <vault-dir>` discovers every `.md` note under the directory (skipping hidden dirs like `.git`/`.obsidian`) and pushes each to `/ingest` through the same client `sb push` uses — letting the server chunk. It targets `$STUDYBUDDY_SERVER` (default `http://127.0.0.1:8080`).
 
 ```bash
-jq -n --arg sf "linear-algebra/vectors.md" --rawfile c ./notes/vectors.md \
-  '{source_file:$sf, content:$c}' \
-| curl -s -X POST localhost:8080/ingest -H 'content-type: application/json' -d @-
+cargo run --bin watcher ./notes
 ```
 
-Response:
-
-```json
-{ "chunks": 1, "proposed_cards": 3, "failed_chunks": 0, "skipped_chunks": 0 }
-```
-
-## Curate and review
-
-```bash
-# list cards awaiting curation
-curl -s localhost:8080/cards/pending | jq
-
-# accept a card into the review pool (due immediately), or reject it
-curl -s -X POST localhost:8080/cards/<id>/accept      # → 204
-curl -s -X POST localhost:8080/cards/<id>/reject      # → 204
-
-# edit a pending card's content before accepting (409 if already accepted)
-curl -s -X PATCH localhost:8080/cards/<id> -H 'content-type: application/json' \
-  -d '{"content":{"type":"qa","front":"...","back":"..."}}'
-
-# run a review session
-curl -s localhost:8080/cards/due | jq
-curl -s -X POST localhost:8080/reviews -H 'content-type: application/json' \
-  -d '{"card_id":"<id>","rating":"good"}'    # rating: again | hard | good | easy
-```
-
-> The **watcher** (`cargo run --bin watcher <dir>`) is currently a skeleton — it walks a directory and reports what it found, but doesn't push to the server yet. For now, feed notes in via `curl` (or any HTTP client).
+This is a one-shot full sweep today; content-hash change detection (push only what changed) and `notify`-based live watching are still to come.
 
 ## Build / test
 

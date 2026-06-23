@@ -2,18 +2,18 @@
 //! to drive the router directly without binding a socket.
 
 use std::sync::Arc;
-use std::sync::atomic::{AtomicUsize, Ordering};
 
-use async_trait::async_trait;
 use axum::body::{Body, to_bytes};
 use axum::http::{Request, StatusCode};
 use studybuddy::api::{self, AppState};
-use studybuddy::llm::{ChunkContext, LlmError, LlmProvider, ProposedCard};
-use studybuddy::model::CardContent;
+use studybuddy::llm::{LlmError, LlmProvider};
 use studybuddy::scheduler::Sm2;
-use studybuddy::store::{FileRepository, InMemoryRepository, Repository};
+use studybuddy::store::{FileRepository, Repository};
 use tower::ServiceExt;
 use uuid::Uuid;
+
+mod common;
+use common::{FakeLlmProvider, in_memory_router as router};
 
 /// A single-heading note that the chunker turns into exactly one chunk.
 const NOTE: &str = "# Vectors\n\nA vector has both magnitude and direction. \
@@ -23,57 +23,6 @@ corresponding components and sums them into a scalar.\n";
 /// Same note, but frontmatter-excluded — `ingest_text` yields no chunks.
 const EXCLUDED_NOTE: &str =
     "---\nstudybuddy:\n  exclude: true\n---\n\n# Vectors\n\nbody text here.\n";
-
-type Respond = Box<dyn Fn(&ChunkContext) -> Result<Vec<ProposedCard>, LlmError> + Send + Sync>;
-
-struct FakeLlmProvider {
-    respond: Respond,
-    calls: AtomicUsize,
-}
-
-impl FakeLlmProvider {
-    fn new(
-        respond: impl Fn(&ChunkContext) -> Result<Vec<ProposedCard>, LlmError> + Send + Sync + 'static,
-    ) -> Self {
-        Self {
-            respond: Box::new(respond),
-            calls: AtomicUsize::new(0),
-        }
-    }
-
-    fn always_one_card() -> Self {
-        Self::new(|_| {
-            Ok(vec![ProposedCard {
-                content: CardContent::Qa {
-                    front: "Q".to_string(),
-                    back: "A".to_string(),
-                },
-                rationale: None,
-            }])
-        })
-    }
-
-    fn calls(&self) -> usize {
-        self.calls.load(Ordering::SeqCst)
-    }
-}
-
-#[async_trait]
-impl LlmProvider for FakeLlmProvider {
-    async fn propose_cards(&self, chunk: &ChunkContext) -> Result<Vec<ProposedCard>, LlmError> {
-        self.calls.fetch_add(1, Ordering::SeqCst);
-        (self.respond)(chunk)
-    }
-}
-
-fn router(llm: Arc<dyn LlmProvider>) -> axum::Router {
-    let store: Arc<dyn Repository> = Arc::new(InMemoryRepository::new());
-    api::router(AppState {
-        llm,
-        store,
-        scheduler: Arc::new(Sm2),
-    })
-}
 
 async fn post_ingest(
     llm: Arc<dyn LlmProvider>,

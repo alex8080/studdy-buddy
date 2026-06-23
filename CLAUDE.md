@@ -4,7 +4,7 @@ This file provides guidance to Claude Code (claude.ai/code) when working with co
 
 ## Status
 
-StudyBuddy is in **early implementation**. Up and tested (74 tests): axum server on `127.0.0.1:8080` with the full HTTP surface — `/health`, content-based `POST /ingest` (push model: `{ source_file, content }` → chunk → LLM → persist `Pending`), curation (`GET /cards/pending`, `POST /cards/{id}/accept|reject`, `PATCH /cards/{id}` → 409 if not pending) and review (`GET /cards/due`, `POST /reviews`). SM-2 scheduler, `ingest_text` parser/chunker, the `store` (`Repository` trait + in-memory + file backend with sha256 sidecars), and a watcher feeder skeleton, all wired into `AppState { llm, store, scheduler }`. Ollama `LlmProvider` exists. Still to build: cloud LLM providers (`llm::anthropic`/`openai`), the watcher's HTTP push + reconciliation protocol, and a web UI.
+StudyBuddy is in **early implementation**. Up and tested (100 tests): axum server on `127.0.0.1:8080` with the full HTTP surface — `/health`, content-based `POST /ingest` (push model: `{ source_file, content }` → chunk → LLM → persist `Pending`), curation (`GET /cards/pending`, `POST /cards/{id}/accept|reject`, `PATCH /cards/{id}` → 409 if not pending) and review (`GET /cards/due`, `POST /reviews`). SM-2 scheduler, `ingest_text` parser/chunker, the `store` (`Repository` trait + in-memory + file backend with sha256 sidecars), a typed HTTP `client` over shared `wire` DTOs, the `sb` CLI (`push`/`curate`/`review`), and a `watcher` feeder that pushes a vault to `/ingest`, all wired into `AppState { llm, store, scheduler }`. Ollama `LlmProvider` exists. Still to build: cloud LLM providers (`llm::anthropic`/`openai`), the watcher's change-detection + `notify` live-watching + reconciliation protocol, and a web UI.
 
 **Design docs:**
 - `DESIGN.md` — high-level vision and load-bearing decisions. Read before non-trivial changes.
@@ -18,8 +18,8 @@ A self-hosted local HTTP server that ingests a directory of markdown notes (Obsi
 ## Tech stack
 
 - **Rust 2024 edition**, single binary crate (`studybuddy`) with `lib.rs` + `main.rs`.
-- **In `Cargo.toml`**: `axum`, `tokio`, `serde`, `serde_json`, `serde_yaml` (frontmatter), `chrono`, `uuid`, `sha2` (sidecar filenames), `thiserror`, `anyhow`, `async-trait`, `tracing`, `tracing-subscriber`. Dev: `tempfile`, `tower` (with `util` feature, for `ServiceExt::oneshot` in API tests).
-- **Planned, not yet added**: `notify` (file watcher), `pulldown-cmark` (richer markdown if line-based parsing isn't enough), `reqwest` + hand-rolled types (LLM clients — no first-party Anthropic/OpenAI Rust SDK), `fsrs-rs` (future), `rusqlite`/`sqlx` (storage — only if a multi-tenant hosted mode arrives; the v1 `store` is file-based behind a `Repository` trait, see `docs/architecture.md`).
+- **In `Cargo.toml`**: `axum`, `tokio`, `serde`, `serde_json`, `serde_yaml` (frontmatter), `chrono`, `uuid`, `sha2` (sidecar filenames), `thiserror`, `anyhow`, `async-trait`, `reqwest` (HTTP client), `clap` (the `sb` CLI, with `derive`/`env`), `tracing`, `tracing-subscriber`. Dev: `tempfile`, `tower` (with `util` feature, for `ServiceExt::oneshot` in API tests), `wiremock` (client unit tests).
+- **Planned, not yet added**: `notify` (file watcher), `pulldown-cmark` (richer markdown if line-based parsing isn't enough), hand-rolled cloud LLM client types (`llm::anthropic`/`openai` — no first-party Anthropic/OpenAI Rust SDK; built on the existing `reqwest`), `fsrs-rs` (future), `rusqlite`/`sqlx` (storage — only if a multi-tenant hosted mode arrives; the v1 `store` is file-based behind a `Repository` trait, see `docs/architecture.md`).
 
 Iteration cost on prompt design is the main downside of Rust here; keep LLM card-generation logic in an isolated module with quick integration tests so prompts can be iterated without recompiling the whole server.
 
@@ -39,19 +39,26 @@ Iteration cost on prompt design is the main downside of Rust here; keep LLM card
 src/
   main.rs        # entry: tracing init, build AppState (store from STUDYBUDDY_DATA_DIR), axum::serve
   lib.rs         # module declarations
-  api.rs         # axum Router + handlers; AppState { llm, store }
+  api.rs         # axum Router + handlers; AppState { llm, store, scheduler }
   error.rs       # AppError, Result alias
   model.rs       # Card, CardContent (Qa | Cloze), CardStatus, Rating, Review
+  wire.rs        # shared HTTP request/response DTOs (server handlers + client)
+  client.rs      # typed reqwest Client — one method per endpoint (shared by sb + watcher)
+  cli.rs         # run_push/run_review/run_curate command logic (injected I/O)
   scheduler.rs   # Scheduler trait + Sm2 impl (with unit tests)
   llm/           # LlmProvider trait, ChunkContext, ProposedCard, ollama (+ retry, prompt)
   ingest.rs      # ChunkConfig, ingest_text (content→chunks) — BUILT; 24 unit tests
   store/         # Repository trait + InMemoryRepository + FileRepository (sha256 sidecars)
-  watcher.rs     # directory walking (ingest_directory/ingest_file), relocated from ingest
-  bin/watcher.rs # feeder skeleton binary (walks a vault; HTTP push is TODO)
+  watcher.rs     # vault walking: ingest_directory/ingest_file + discover_notes (raw push)
+  bin/sb.rs      # `sb` CLI: thin clap shell over cli.rs (push/curate/review, $EDITOR for edits)
+  bin/watcher.rs # feeder binary: discover_notes → Client::ingest (one-shot vault push)
 tests/
-  watcher.rs                 # 9 acceptance tests for ingest_directory (real fixtures)
+  watcher.rs                 # 11 acceptance tests: ingest_directory + discover_notes (real fixtures)
   store.rs                   # 6 acceptance tests for FileRepository (tempdir)
-  api.rs                     # 9 integration tests driving the Router via tower::ServiceExt::oneshot
+  api.rs                     # 15 integration tests driving the Router via tower::ServiceExt::oneshot
+  client.rs                  # acceptance: Client vs a real spawned server (the wire contract)
+  cli.rs                     # acceptance: cli::run_* with injected I/O vs a spawned server
+  common/mod.rs              # shared harness: FakeLlmProvider + spawn_server / in_memory_router
   fixtures/ingest/           # nested/, mixed_extensions/, hidden_dirs/, sample_vault/ (used by tests/watcher.rs)
 ```
 
@@ -62,7 +69,7 @@ tests/
 
 When adding behavior to ingest: write a failing unit test first (synthetic input), then add an acceptance test only if it changes how the system composes end-to-end on a realistic vault.
 
-Subsystems still to build: the watcher's HTTP push + reconciliation, and concrete LLM providers (`llm::anthropic`, `llm::openai`; `llm::ollama` exists).
+Subsystems still to build: the watcher's change-detection + `notify` live-watching + reconciliation protocol, and concrete cloud LLM providers (`llm::anthropic`, `llm::openai`; `llm::ollama` exists).
 
 ## Ingest behavior (the contract the tests enforce)
 
