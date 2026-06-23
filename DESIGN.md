@@ -45,43 +45,60 @@ built in.* No existing tool does all four.
 
 ## Architecture
 
-**Self-hosted local web server with an HTTP API.** Frontends — web UI first,
-others later — are clients of this API. The server runs on the user's machine
-(e.g. `localhost:8080`), reads markdown directly from their local filesystem,
-and keeps SRS state in a local database.
+**Self-hosted local web server with an HTTP API.** Frontends — the `sb` CLI
+today, a web UI next, others later — are clients of this API. So are the
+*feeders* that supply notes: the server never reads the vault filesystem itself,
+it receives pushed note content. The server runs on the user's machine (e.g.
+`localhost:8080`) and keeps cards and SRS state in a local file-based store.
 
 ```
-+-----------------+         +------------------+         +----------------+
-|  Markdown dir   | <-----> |  StudyBuddy      | <-----> |  Frontend(s)   |
-|  (Obsidian      |  watch  |  local server    |  HTTP   |  web / CLI /   |
-|   folder)       |         |  (API + SRS +    |         |  mobile (v2+)  |
-+-----------------+         |   LLM adapter)   |         +----------------+
-                            +------------------+
+                 read       +------------------+
++-----------------+ ------> |  feeder          |
+|  Markdown dir   |         |  (watcher, or    |
+|  (Obsidian      |         |   sb push)       |
+|   folder)       |         +--------+---------+
++-----------------+                  | HTTP push
+                                     | POST /ingest {source_file, content}
+                                     v
+                            +------------------+   HTTP   +----------------+
+                            |  StudyBuddy      | <------> |  Frontends     |
+                            |  local server    |         |  (sb CLI now,  |
+                            |  (API + SRS +    |         |   web UI next) |
+                            |   LLM adapter)   |         +----------------+
+                            +--------+---------+
                                      |
                                      v
                             +------------------+
-                            |  Local DB        |
-                            |  (cards, review  |
-                            |   history)       |
+                            |  Local store     |
+                            |  (files: cards,  |
+                            |   state, reviews)|
                             +------------------+
 ```
+
+The `sb` CLI is both: it pushes notes (a feeder) *and* drives curation/review (a
+frontend). The watcher is feeder-only.
 
 ### Why backend-first
 
 - Notes are local; running the server locally means no upload, no sync agent,
   no privacy concern.
 - A single API decouples SRS/LLM logic from any specific UI.
-- Future frontends (mobile, CLI, IDE plugin) don't require rewriting the core.
+- Frontends (the `sb` CLI today; web, mobile, IDE plugins later) don't require
+  rewriting the core.
 
 ## Core flows
 
 ### 1. Ingest
 
-1. User configures a source directory.
-2. Server walks the directory, parses each `.md` file.
-3. Obsidian-specific syntax: `#tags` and YAML frontmatter are extracted as
-   signal; wikilinks and callouts are stripped to plain text. Frontmatter may
-   carry per-file config (e.g. `studybuddy: { exclude: true }`).
+1. A feeder is pointed at the source directory — the `watcher` for a whole
+   vault, or `sb push` for a single file.
+2. The feeder discovers `.md` files and pushes each note's content to the server
+   (`POST /ingest { source_file, content }`); the server never reads the
+   filesystem.
+3. The server parses the pushed markdown. Obsidian-specific syntax: `#tags` and
+   YAML frontmatter are extracted as signal; wikilinks and callouts are stripped
+   to plain text. Frontmatter may carry per-file config (e.g.
+   `studybuddy: { exclude: true }`).
 4. Content is chunked (heading-based) and sent to the configured LLM for card
    proposals.
 5. Proposed cards land in a "pending review" queue.
@@ -108,7 +125,8 @@ browser notifications, etc.
 
 ### 4. Note sync (reconciliation)
 
-The server watches the source directory. When a file changes:
+The watcher feeder watches the source directory and pushes changes; the server
+reconciles (still to build). When a note changes:
 - New/changed chunks → new card proposals into the pending queue.
 - Cards whose source heading was removed → flagged **orphaned**, not deleted.
   User decides whether to keep, edit, or remove.
@@ -169,7 +187,8 @@ Review
 4. Card proposal → curation queue → accepted-card store.
 5. SM-2 scheduler behind a `Scheduler` interface.
 6. Reconciliation (orphan/stale flagging) driven by the feeder's change reports.
-7. A minimal web UI to drive curation and review.
+7. An `sb` CLI client that drives push, curation, and review over the HTTP API.
+8. A minimal web UI to drive curation and review.
 
 ## Open for later
 
