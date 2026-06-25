@@ -1,0 +1,17 @@
+# StudyBuddy configuration.
+# Copy to studybuddy.toml, or point STUDYBUDDY_CONFIG=/path/to/file at a custom path.
+# All values shown are defaults — omit any section or field you don't need to change.
+
+[server]
+bind = "127.0.0.1:8080"
+
+[store]
+data_dir = "./studybuddy-data"
+
+[llm]
+provider    = "ollama"
+model       = "gpt-oss:120b-cloud"   # or e.g. "qwen3:8b" for a local model
+base_url    = "http://127.0.0.1:11434"
+temperature = 0.2
+# num_predict = 2048                 # max tokens; omit to use Ollama's default
+# api_key     = ""                   # reserved for future cloud providers (Anthropic, OpenAI)

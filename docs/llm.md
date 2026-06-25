@@ -147,25 +147,33 @@ User message: `{ "heading": ..., "tags": [...], "text": ... }` as JSON.
 
 ## Configuration
 
-Config lives in a TOML file. Path resolution:
+All server-side config lives in a single TOML file. Path resolution:
 
 1. `STUDYBUDDY_CONFIG=/path/to/config.toml` env var, if set.
 2. `./studybuddy.toml` in the process cwd, otherwise.
+3. Built-in defaults if neither file exists — the server starts with no config file.
 
-Example (`studybuddy.toml.example`):
+Full shape (see `studybuddy.toml.example` at the project root):
 
 ```toml
+[server]
+bind = "127.0.0.1:8080"
+
+[store]
+data_dir = "./studybuddy-data"
+
 [llm]
 provider    = "ollama"
 model       = "gpt-oss:120b-cloud"   # or e.g. "qwen3:8b" for local
 base_url    = "http://127.0.0.1:11434"
 temperature = 0.2
-num_predict = 2048
+# num_predict = 2048                 # omit to use Ollama's default
+# api_key     = ""                   # reserved for future cloud providers
 ```
 
-The `[llm]` section is parsed into a provider-specific config and handed to the corresponding constructor. Adding a new provider means adding a new variant to the parser, not changing the file format.
+Unknown fields and unknown sections are rejected at startup (typos surface immediately rather than silently using the wrong default). All fields have defaults, so the file can be partial — only override what you need.
 
-`main.rs` constructs the provider, wraps it in `RetryingProvider`, hands the `Arc<dyn LlmProvider>` to the router via state.
+`main.rs` matches on `llm.provider`, rejects unknown values with a clear error, constructs the appropriate provider, wraps it in `RetryingProvider`, and hands the `Arc<dyn LlmProvider>` to the router via state.
 
 ## Module layout
 
@@ -198,4 +206,4 @@ The retry layer and Ollama provider are tested in isolation; the handler-with-fa
 
 ## Status
 
-Designed, not built. The trait and value types exist in `src/llm.rs`; the directory layout, `LlmError`, `RetryingProvider`, `OllamaProvider`, prompts, and config-file parsing are all yet to land.
+Built. Trait, error taxonomy, `RetryingProvider` with exponential backoff, `OllamaProvider` with structured-JSON output, prompt builder, and config-file parsing (`src/config.rs`, `studybuddy.toml.example`) are all in place. Still to build: `llm::anthropic` and `llm::openai` concrete providers.

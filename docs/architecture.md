@@ -138,7 +138,7 @@ pub trait Repository: Send + Sync {
 
 Every method maps to a documented call site in [api.md](api.md); nothing speculative. Async to match `LlmProvider` (the other I/O trait) and to let an async `sqlx` backend drop in unchanged. Deliberately omitted for now (YAGNI): single-card `get` (the file backend reads-to-write, so `update_content` enforces the `Pending`-only guard in place), `Note`-metadata persistence and by-`source_file` lookups (watcher-reconciliation needs, added when the watcher lands), and any `delete` (cards are flagged, never removed).
 
-**v1 backend: files, not a database.** The store holds *derived* data — cards and SRS state are generated, not authored; the markdown vault stays the source of truth for notes. The store lives in a **configured server data dir** (`STUDYBUDDY_DATA_DIR`, default `./studybuddy-data`), independent of any vault — one store per server. At single-user scale a file backend is enough, stays inspectable, and avoids a DB dependency. Directly under the data dir:
+**v1 backend: files, not a database.** The store holds *derived* data — cards and SRS state are generated, not authored; the markdown vault stays the source of truth for notes. The store lives in a **configured server data dir** (`store.data_dir` in `studybuddy.toml`, default `./studybuddy-data`), independent of any vault — one store per server. At single-user scale a file backend is enough, stays inspectable, and avoids a DB dependency. Directly under the data dir:
 
 - **Cards: one file per note.** All cards for a note live in one sidecar at `cards/<sha256(source_file)>.json`, keyed by the `(source_file, source_heading)` anchor (the readable path lives inside each card). The filename is a hash of the note's vault-relative path because that path arrives as **untrusted HTTP input** — hashing is flat, fixed-length, and traversal-proof. One-file-per-note matches reconciliation: re-ingest one note → rewrite one sidecar. Each card carries a stable UUID (assigned at acceptance) so content edits don't churn the IDs scheduling state references.
 - **Current SRS state: one `state.json`.** A compact `card_id → (SchedulerState, next_due)` map. Storing `next_due` here (decision B) is what makes it a genuine due-index: a due-scan reads this one file, never the unbounded review log. Tiny even at thousands of cards; each review rewrites it via atomic temp-write-and-rename.
@@ -184,7 +184,8 @@ Per-endpoint flows live in [api.md](api.md). The main one — `POST /ingest` —
 | api | full HTTP surface: `/health`, content-based `POST /ingest`, curation (`/cards/pending`, accept/reject, `PATCH`) + review (`/cards/due`, `POST /reviews`); 15 integration tests |
 | wire + client | shared DTOs + typed `reqwest` client; `wiremock` unit tests + `tests/client.rs` lifecycle vs a real spawned server |
 | cli (`sb`) | `push`/`curate`/`review` over the client (injected-I/O logic in `cli.rs`, clap shell in `bin/sb.rs`); `tests/cli.rs` acceptance |
-| llm | trait + types; Ollama provider exists, cloud providers not built |
+| config | `src/config.rs` — `[server]`, `[store]`, `[llm]` sections; `STUDYBUDDY_CONFIG` env override; deny-unknown-fields; 5 unit tests |
+| llm | trait + types + `OllamaProvider` + `RetryingProvider` + prompt builder; config-file wired; cloud providers not built |
 | store | `Repository` trait + in-memory (10 unit) + file backend (6 acceptance), sha256 sidecars under the data dir; wired into `AppState` |
 | watcher | feeder binary pushes a vault via `Client::ingest` (`discover_notes`); walkers in `src/watcher.rs`, 11 acceptance tests. Change-detection + `notify` live-watching + reconciliation not yet built |
 

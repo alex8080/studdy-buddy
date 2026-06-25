@@ -1,11 +1,11 @@
-use std::net::SocketAddr;
-use std::path::PathBuf;
 use std::sync::Arc;
 
 use anyhow::Result;
 use tracing_subscriber::EnvFilter;
 
 use studybuddy::api::{self, AppState};
+use studybuddy::config::Config;
+use studybuddy::llm::LlmProvider;
 use studybuddy::llm::ollama::{OllamaConfig, OllamaProvider};
 use studybuddy::llm::retry::{RetryPolicy, RetryingProvider};
 use studybuddy::scheduler::Sm2;
@@ -19,27 +19,34 @@ async fn main() -> Result<()> {
         )
         .init();
 
-    let llm_config = OllamaConfig {
-        model: "gpt-oss:120b-cloud".to_string(),
-        base_url: "http://127.0.0.1:11434".to_string(),
-        temperature: Some(0.2),
-        num_predict: None,
+    let config = Config::load()?;
+
+    let llm: Arc<dyn LlmProvider> = match config.llm.provider.as_str() {
+        "ollama" => {
+            let ollama_config = OllamaConfig {
+                model: config.llm.model,
+                base_url: config.llm.base_url,
+                temperature: config.llm.temperature,
+                num_predict: config.llm.num_predict,
+            };
+            Arc::new(RetryingProvider::new(
+                OllamaProvider::new(ollama_config),
+                RetryPolicy::default(),
+            ))
+        }
+        other => anyhow::bail!(
+            "unsupported LLM provider '{other}' — only 'ollama' is supported in this build"
+        ),
     };
 
-    let ollama_provider = OllamaProvider::new(llm_config);
-    let retrying_provider = RetryingProvider::new(ollama_provider, RetryPolicy::default());
-
-    let data_dir =
-        std::env::var("STUDYBUDDY_DATA_DIR").unwrap_or_else(|_| "./studybuddy-data".to_string());
     let state = AppState {
-        llm: Arc::new(retrying_provider),
-        store: Arc::new(FileRepository::new(PathBuf::from(data_dir))),
+        llm,
+        store: Arc::new(FileRepository::new(config.store.data_dir)),
         scheduler: Arc::new(Sm2),
     };
 
-    let addr: SocketAddr = "127.0.0.1:8080".parse()?;
-    let listener = tokio::net::TcpListener::bind(addr).await?;
-    tracing::info!("studybuddy listening on http://{addr}");
+    let listener = tokio::net::TcpListener::bind(config.server.bind).await?;
+    tracing::info!("studybuddy listening on http://{}", config.server.bind);
 
     axum::serve(listener, api::router(state)).await?;
     Ok(())
