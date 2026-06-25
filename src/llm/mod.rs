@@ -9,7 +9,7 @@ use serde::{Deserialize, Serialize};
 
 use crate::model::CardContent;
 
-#[derive(Debug)]
+#[derive(Debug, Clone)]
 pub enum LlmError {
     Transient {
         reason: String,

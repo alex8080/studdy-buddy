@@ -7,6 +7,7 @@ use tracing_subscriber::EnvFilter;
 
 use studybuddy::api::{self, AppState};
 use studybuddy::llm::ollama::{OllamaConfig, OllamaProvider};
+use studybuddy::llm::retry::{RetryPolicy, RetryingProvider};
 use studybuddy::scheduler::Sm2;
 use studybuddy::store::FileRepository;
 
@@ -24,10 +25,14 @@ async fn main() -> Result<()> {
         temperature: Some(0.2),
         num_predict: None,
     };
+
+    let ollama_provider = OllamaProvider::new(llm_config);
+    let retrying_provider = RetryingProvider::new(ollama_provider, RetryPolicy::default());
+
     let data_dir =
         std::env::var("STUDYBUDDY_DATA_DIR").unwrap_or_else(|_| "./studybuddy-data".to_string());
     let state = AppState {
-        llm: Arc::new(OllamaProvider::new(llm_config)),
+        llm: Arc::new(retrying_provider),
         store: Arc::new(FileRepository::new(PathBuf::from(data_dir))),
         scheduler: Arc::new(Sm2),
     };
