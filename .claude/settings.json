@@ -1,0 +1,30 @@
+{
+  "permissions": {
+    "allow": ["Bash(cargo fmt*)", "Bash(cargo clippy*)"]
+  },
+  "hooks": {
+    "PostToolUse": [
+      {
+        "matcher": "Write|Edit",
+        "hooks": [
+          {
+            "type": "command",
+            "command": "FILE=$(jq -r '.tool_input.file_path'); case \"$FILE\" in *.rs) cargo fmt ;; esac"
+          }
+        ]
+      }
+    ],
+    "PreToolUse": [
+      {
+        "matcher": "Bash",
+        "hooks": [
+          {
+            "type": "command",
+            "if": "Bash(git commit*)",
+            "command": "OUT=$(cargo clippy --all-targets --message-format=short 2>&1); [ $? -ne 0 ] && jq -n --arg r \"clippy failed: $OUT\" '{\"continue\": false, \"stopReason\": $r}' || true"
+          }
+        ]
+      }
+    ]
+  }
+}
