@@ -15,6 +15,7 @@ pub struct Config {
 #[serde(default, deny_unknown_fields)]
 pub struct ServerConfig {
     pub bind: SocketAddr,
+    pub api_token: Option<String>,
 }
 
 #[derive(Debug, serde::Deserialize)]
@@ -40,6 +41,7 @@ impl Default for ServerConfig {
             bind: "127.0.0.1:8080"
                 .parse()
                 .expect("valid default bind address"),
+            api_token: None,
         }
     }
 }
@@ -167,5 +169,20 @@ level = "debug"
 "#,
         );
         assert!(result.is_err());
+    }
+
+    #[test]
+    fn api_token_defaults_to_none_and_can_be_set() {
+        let cfg = Config::from_toml_str("").unwrap();
+        assert_eq!(cfg.server.api_token, None);
+
+        let cfg = Config::from_toml_str(
+            r#"
+[server]
+api_token = "mysecret"
+"#,
+        )
+        .unwrap();
+        assert_eq!(cfg.server.api_token.as_deref(), Some("mysecret"));
     }
 }

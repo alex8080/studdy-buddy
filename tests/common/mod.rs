@@ -65,11 +65,16 @@ impl LlmProvider for FakeLlmProvider {
 
 /// Build the axum router over an in-memory store + SM-2 scheduler.
 pub fn in_memory_router(llm: Arc<dyn LlmProvider>) -> Router {
+    in_memory_router_with_token(llm, None)
+}
+
+pub fn in_memory_router_with_token(llm: Arc<dyn LlmProvider>, token: Option<String>) -> Router {
     let store: Arc<dyn Repository> = Arc::new(InMemoryRepository::new());
     api::router(AppState {
         llm,
         store,
         scheduler: Arc::new(Sm2),
+        api_token: token,
     })
 }
 

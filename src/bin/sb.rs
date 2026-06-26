@@ -28,6 +28,10 @@ struct Cli {
     )]
     server: String,
 
+    /// Bearer token for server authentication.
+    #[arg(long, global = true, env = "STUDYBUDDY_API_TOKEN")]
+    api_token: Option<String>,
+
     #[command(subcommand)]
     command: Command,
 }
@@ -59,7 +63,13 @@ async fn main() -> ExitCode {
 
 async fn run() -> Result<()> {
     let cli = Cli::parse();
-    let client = Client::new(cli.server);
+    let client = match &cli.api_token {
+        Some(t) => {
+            studybuddy::client::validate_api_token(t)?;
+            Client::authenticated(&cli.server, t)
+        }
+        None => Client::new(&cli.server),
+    };
     let stdout = std::io::stdout();
     let mut out = stdout.lock();
 

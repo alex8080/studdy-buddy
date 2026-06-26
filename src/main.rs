@@ -43,6 +43,7 @@ async fn main() -> Result<()> {
         llm,
         store: Arc::new(FileRepository::new(config.store.data_dir)),
         scheduler: Arc::new(Sm2),
+        api_token: config.server.api_token,
     };
 
     let listener = tokio::net::TcpListener::bind(config.server.bind).await?;

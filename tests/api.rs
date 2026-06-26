@@ -13,7 +13,7 @@ use tower::ServiceExt;
 use uuid::Uuid;
 
 mod common;
-use common::{FakeLlmProvider, in_memory_router as router};
+use common::{FakeLlmProvider, in_memory_router as router, in_memory_router_with_token};
 
 /// A single-heading note that the chunker turns into exactly one chunk.
 const NOTE: &str = "# Vectors\n\nA vector has both magnitude and direction. \
@@ -371,6 +371,7 @@ async fn file_backed_lifecycle_smoke() {
         llm,
         store,
         scheduler: Arc::new(Sm2),
+        api_token: None,
     });
 
     // ingest → pending → accept → due → review, all hitting the file store.
@@ -415,4 +416,104 @@ async fn review_unknown_card_is_404() {
     )
     .await;
     assert_eq!(status, StatusCode::NOT_FOUND);
+}
+
+// ---- bearer token auth ----
+
+const TEST_TOKEN: &str = "s3cr3t";
+
+fn app_with_token() -> axum::Router {
+    in_memory_router_with_token(
+        Arc::new(FakeLlmProvider::always_one_card()),
+        Some(TEST_TOKEN.to_string()),
+    )
+}
+
+async fn oneshot(app: axum::Router, req: Request<Body>) -> (StatusCode, serde_json::Value) {
+    let res = app.oneshot(req).await.unwrap();
+    let status = res.status();
+    let bytes = to_bytes(res.into_body(), usize::MAX).await.unwrap();
+    let v: serde_json::Value = if bytes.is_empty() {
+        serde_json::Value::Null
+    } else {
+        serde_json::from_slice(&bytes).unwrap()
+    };
+    (status, v)
+}
+
+#[tokio::test]
+async fn health_is_open_when_token_configured() {
+    let (status, body) = oneshot(
+        app_with_token(),
+        Request::builder()
+            .uri("/health")
+            .body(Body::empty())
+            .unwrap(),
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK);
+    assert_eq!(body["status"], "ok");
+}
+
+#[tokio::test]
+async fn protected_endpoint_is_401_without_token_header() {
+    let (status, body) = oneshot(
+        app_with_token(),
+        Request::builder()
+            .method("GET")
+            .uri("/cards/pending")
+            .body(Body::empty())
+            .unwrap(),
+    )
+    .await;
+    assert_eq!(status, StatusCode::UNAUTHORIZED);
+    assert!(body["error"].as_str().is_some());
+}
+
+#[tokio::test]
+async fn protected_endpoint_is_401_with_wrong_token() {
+    let (status, body) = oneshot(
+        app_with_token(),
+        Request::builder()
+            .method("GET")
+            .uri("/cards/pending")
+            .header("authorization", "Bearer wrong-token")
+            .body(Body::empty())
+            .unwrap(),
+    )
+    .await;
+    assert_eq!(status, StatusCode::UNAUTHORIZED);
+    assert!(body["error"].as_str().is_some());
+}
+
+#[tokio::test]
+async fn protected_endpoint_is_accessible_with_valid_token() {
+    let (status, body) = oneshot(
+        app_with_token(),
+        Request::builder()
+            .method("GET")
+            .uri("/cards/pending")
+            .header("authorization", format!("Bearer {TEST_TOKEN}"))
+            .body(Body::empty())
+            .unwrap(),
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK);
+    assert!(body["cards"].is_array());
+}
+
+#[tokio::test]
+async fn unauthorized_response_includes_www_authenticate_header() {
+    let res = app_with_token()
+        .oneshot(
+            Request::builder()
+                .method("GET")
+                .uri("/cards/pending")
+                .body(Body::empty())
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    assert_eq!(res.status(), StatusCode::UNAUTHORIZED);
+    assert_eq!(res.headers().get("www-authenticate").unwrap(), "Bearer");
 }

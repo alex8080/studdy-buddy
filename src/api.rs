@@ -3,13 +3,15 @@ use std::sync::Arc;
 
 use axum::{
     Json, Router,
-    extract::{Path, State},
-    http::StatusCode,
+    extract::{Path, Request, State},
+    http::{HeaderValue, StatusCode, header},
+    middleware::{Next, from_fn_with_state},
     response::{IntoResponse, Response},
     routing::{get, patch, post},
 };
 use chrono::Utc;
 use serde::Serialize;
+use sha2::{Digest, Sha256};
 use uuid::Uuid;
 
 use crate::error::AppError;
@@ -28,11 +30,11 @@ pub struct AppState {
     pub llm: Arc<dyn LlmProvider>,
     pub store: Arc<dyn Repository>,
     pub scheduler: Arc<dyn Scheduler>,
+    pub api_token: Option<String>,
 }
 
 pub fn router(state: AppState) -> Router {
-    Router::new()
-        .route("/health", get(health))
+    let protected = Router::new()
         .route(path::INGEST, post(ingest))
         .route(path::CARDS_PENDING, get(cards_pending))
         .route(path::CARDS_DUE, get(cards_due))
@@ -40,7 +42,40 @@ pub fn router(state: AppState) -> Router {
         .route("/cards/{id}/reject", post(reject_card))
         .route("/cards/{id}", patch(patch_card))
         .route(path::REVIEWS, post(post_review))
+        .route_layer(from_fn_with_state(state.clone(), require_bearer));
+
+    Router::new()
+        .route("/health", get(health))
+        .merge(protected)
         .with_state(state)
+}
+
+async fn require_bearer(State(state): State<AppState>, req: Request, next: Next) -> Response {
+    let Some(expected) = &state.api_token else {
+        return next.run(req).await;
+    };
+
+    let authorized = req
+        .headers()
+        .get(header::AUTHORIZATION)
+        .and_then(|v| v.to_str().ok())
+        .and_then(|s| s.strip_prefix("Bearer "))
+        .map(|presented| token_digest(presented) == token_digest(expected))
+        .unwrap_or(false);
+
+    if authorized {
+        next.run(req).await
+    } else {
+        let body = Json(serde_json::json!({ ERROR_KEY: "unauthorized" }));
+        let mut resp = (StatusCode::UNAUTHORIZED, body).into_response();
+        resp.headers_mut()
+            .insert(header::WWW_AUTHENTICATE, HeaderValue::from_static("Bearer"));
+        resp
+    }
+}
+
+fn token_digest(token: &str) -> [u8; 32] {
+    Sha256::digest(token.as_bytes()).into()
 }
 
 #[derive(Serialize)]
@@ -239,6 +274,13 @@ impl IntoResponse for AppError {
             AppError::Parse(s) => (StatusCode::BAD_REQUEST, s),
             AppError::BadRequest(s) => (StatusCode::BAD_REQUEST, s),
             AppError::Conflict(s) => (StatusCode::CONFLICT, s),
+            AppError::Unauthorized => {
+                let body = Json(serde_json::json!({ ERROR_KEY: "unauthorized" }));
+                let mut resp = (StatusCode::UNAUTHORIZED, body).into_response();
+                resp.headers_mut()
+                    .insert(header::WWW_AUTHENTICATE, HeaderValue::from_static("Bearer"));
+                return resp;
+            }
         };
         (status, Json(serde_json::json!({ ERROR_KEY: msg }))).into_response()
     }

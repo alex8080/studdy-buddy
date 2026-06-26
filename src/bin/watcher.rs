@@ -24,7 +24,17 @@ async fn main() -> ExitCode {
     };
     let server =
         std::env::var("STUDYBUDDY_SERVER").unwrap_or_else(|_| "http://127.0.0.1:8080".to_string());
-    let client = Client::new(server);
+    let token = std::env::var("STUDYBUDDY_API_TOKEN").ok();
+    let client = match &token {
+        Some(t) => {
+            if let Err(e) = studybuddy::client::validate_api_token(t) {
+                eprintln!("error: {e}");
+                return ExitCode::FAILURE;
+            }
+            Client::authenticated(&server, t)
+        }
+        None => Client::new(&server),
+    };
 
     let notes = match discover_notes(&root) {
         Ok(notes) => notes,

@@ -14,6 +14,8 @@ pub enum AppError {
     BadRequest(String),
     #[error("conflict: {0}")]
     Conflict(String),
+    #[error("unauthorized")]
+    Unauthorized,
 }
 
 pub type Result<T> = std::result::Result<T, AppError>;

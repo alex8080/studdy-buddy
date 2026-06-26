@@ -4,7 +4,7 @@ This file provides guidance to Claude Code (claude.ai/code) when working with co
 
 ## Status
 
-StudyBuddy is in **early implementation**. Up and tested (105 tests): axum server on `127.0.0.1:8080` with the full HTTP surface — `/health`, content-based `POST /ingest` (push model: `{ source_file, content }` → chunk → LLM → persist `Pending`), curation (`GET /cards/pending`, `POST /cards/{id}/accept|reject`, `PATCH /cards/{id}` → 409 if not pending) and review (`GET /cards/due`, `POST /reviews`). SM-2 scheduler, `ingest_text` parser/chunker, the `store` (`Repository` trait + in-memory + file backend with sha256 sidecars), a typed HTTP `client` over shared `wire` DTOs, the `sb` CLI (`push`/`curate`/`review`), and a `watcher` feeder that pushes a vault to `/ingest`, all wired into `AppState { llm, store, scheduler }`. Ollama `LlmProvider` + `RetryingProvider` + config-file loading (`studybuddy.toml`) exist. Still to build: cloud LLM providers (`llm::anthropic`/`openai`), the watcher's change-detection + `notify` live-watching + reconciliation protocol, and a web UI.
+StudyBuddy is in **early implementation**. Up and tested (112 tests): axum server on `127.0.0.1:8080` with the full HTTP surface — `/health`, content-based `POST /ingest` (push model: `{ source_file, content }` → chunk → LLM → persist `Pending`), curation (`GET /cards/pending`, `POST /cards/{id}/accept|reject`, `PATCH /cards/{id}` → 409 if not pending) and review (`GET /cards/due`, `POST /reviews`). SM-2 scheduler, `ingest_text` parser/chunker, the `store` (`Repository` trait + in-memory + file backend with sha256 sidecars), a typed HTTP `client` over shared `wire` DTOs, the `sb` CLI (`push`/`curate`/`review`), and a `watcher` feeder that pushes a vault to `/ingest`, all wired into `AppState { llm, store, scheduler, api_token }`. Ollama `LlmProvider` + `RetryingProvider` + config-file loading (`studybuddy.toml`) exist. Bearer-token auth is implemented (see Auth section below). Still to build: cloud LLM providers (`llm::anthropic`/`openai`), the watcher's change-detection + `notify` live-watching + reconciliation protocol, and a web UI.
 
 **Design docs:**
 - `DESIGN.md` — high-level vision and load-bearing decisions. Read before non-trivial changes.
@@ -87,9 +87,17 @@ Subsystems still to build: the watcher's change-detection + `notify` live-watchi
 
 Per-card leaf anchoring within a merged chunk is **out of scope for ingest** — it requires LLM cooperation during card generation. v1 attributes all cards from a merged chunk to the chunk's heading (common ancestor).
 
+## Auth
+
+- Bearer token: `[server] api_token = "..."` in `studybuddy.toml` or `STUDYBUDDY_API_TOKEN` env var.
+- `GET /health` is intentionally unprotected (reverse-proxy health checks); all other routes require the token when one is configured.
+- Token comparison uses SHA-256 digests (timing-safe, no new dep — `sha2` already present).
+- Token validated at CLI startup via `client::validate_api_token()`, not deep in the client.
+- `tests/common/mod.rs` has `in_memory_router_with_token(llm, token)` for auth integration tests.
+
 ## Load-bearing constraints (don't violate without re-opening the design)
 
-- **Self-hosted local only in v1.** No SaaS, no auth, no multi-user concerns.
+- **Self-hosted local only in v1.** No SaaS, no multi-user concerns. Bearer-token auth exists for remote access (`[server] api_token` / `STUDYBUDDY_API_TOKEN`).
 - **Source of truth is the user's markdown.** No web augmentation in v1 — the LLM works from notes only.
 - **Cards keep a `(source_file, source_heading)` anchor.** Cheap to add now, painful to retrofit. Every card type must carry it.
 - **SRS lives behind a `Scheduler` trait.** SM-2 is the v1 implementation; FSRS swaps in later via `fsrs-rs`. Do not let SM-2-specific state leak into the rest of the code.

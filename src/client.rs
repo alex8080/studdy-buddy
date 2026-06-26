@@ -6,7 +6,10 @@
 //! server; it holds no domain logic.
 
 use anyhow::{Result, anyhow};
-use reqwest::{Response, StatusCode};
+use reqwest::{
+    Response, StatusCode,
+    header::{AUTHORIZATION, HeaderMap, HeaderValue},
+};
 use serde::de::DeserializeOwned;
 
 use crate::model::{Card, CardContent, CardId, Rating};
@@ -25,13 +28,36 @@ impl Client {
     /// Build a client for `base_url` (e.g. `http://127.0.0.1:8080`). A trailing
     /// slash is trimmed so path joins stay clean.
     pub fn new(base_url: impl Into<String>) -> Self {
+        Self::build(base_url, None)
+    }
+
+    /// Build an authenticated client. Every request will carry
+    /// `Authorization: Bearer <token>`.
+    pub fn authenticated(base_url: impl Into<String>, token: &str) -> Self {
+        Self::build(base_url, Some(token))
+    }
+
+    fn build(base_url: impl Into<String>, token: Option<&str>) -> Self {
         let mut base = base_url.into();
         while base.ends_with('/') {
             base.pop();
         }
+        let http = match token {
+            Some(t) => {
+                let value = HeaderValue::from_str(&format!("Bearer {t}"))
+                    .expect("api token must be a valid HTTP header value");
+                let mut headers = HeaderMap::new();
+                headers.insert(AUTHORIZATION, value);
+                reqwest::Client::builder()
+                    .default_headers(headers)
+                    .build()
+                    .expect("reqwest client build")
+            }
+            None => reqwest::Client::new(),
+        };
         Self {
             base_url: base,
-            http: reqwest::Client::new(),
+            http,
         }
     }
 
@@ -147,6 +173,19 @@ async fn error_from(status: StatusCode, resp: Response) -> anyhow::Error {
         .filter(|s| !s.is_empty())
         .unwrap_or(body);
     anyhow!("server returned {status}: {msg}")
+}
+
+/// Validate an API token before it reaches the HTTP layer.
+///
+/// HTTP header values must be ASCII; a non-ASCII token would panic inside
+/// `Client::authenticated`. Call this at process startup when reading the token
+/// from an env var or CLI flag so the user sees a clean error.
+pub fn validate_api_token(token: &str) -> anyhow::Result<()> {
+    anyhow::ensure!(
+        token.is_ascii(),
+        "STUDYBUDDY_API_TOKEN must contain only ASCII characters"
+    );
+    Ok(())
 }
 
 #[cfg(test)]
@@ -265,5 +304,17 @@ mod tests {
         let msg = err.to_string();
         assert!(msg.contains("404"), "{msg}");
         assert!(msg.contains("not found"), "{msg}");
+    }
+
+    #[test]
+    fn ascii_token_is_valid() {
+        assert!(validate_api_token("my-secret-token").is_ok());
+        assert!(validate_api_token("550e8400-e29b-41d4-a716-446655440000").is_ok());
+    }
+
+    #[test]
+    fn non_ascii_token_is_rejected() {
+        assert!(validate_api_token("tëken").is_err());
+        assert!(validate_api_token("秘密").is_err());
     }
 }
