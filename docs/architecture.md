@@ -84,21 +84,23 @@ Defines the boundary between "chunked text" and "proposed cards." Pluggable for 
 
 ```
 LlmProvider::propose_cards(chunk: &ChunkContext) -> Result<Vec<ProposedCard>, LlmError>
+LlmProvider::evaluate_answer(card: &Card, user_answer: &str) -> Result<EvaluationResult, LlmError>
 ```
 
 | Type | Role |
 |---|---|
 | `ChunkContext { source_file, source_heading, tags, text }` | LLM input — produced by `ingest` |
 | `ProposedCard { content, rationale }` | LLM output — goes into the pending-review queue |
+| `EvaluationResult { verdict, explanation, suggested_rating }` | LLM output for `POST /reviews/evaluate` — verdict is `correct`/`partial`/`incorrect` |
 | `LlmError::{Transient, BadInput, Config}` | Provider failure classified by recovery action |
 
 A `RetryingProvider<P>` decorator handles `Transient` retries once for all providers — concrete impls (`llm::ollama` first, then `llm::anthropic` / `llm::openai`) only need to make one attempt and classify the error. Prompt text lives in `src/llm/prompt.rs` so it can be iterated without recompiling the rest of the server.
 
 Concrete providers are **not** yet built. See [llm.md](llm.md) for the full design — error taxonomy, retry decorator, Ollama specifics, config-file shape, and the testing strategy.
 
-### `api` (`src/api.rs`) — built
+### `api` (`src/api.rs`) — built (+ one endpoint planned)
 
-Axum router + handlers over `AppState { llm, store, scheduler }`. Endpoints: `/health`, `POST /ingest`, `GET /cards/pending`, `GET /cards/due`, `POST /reviews`, `POST /cards/{id}/accept`, `POST /cards/{id}/reject`, `PATCH /cards/{id}`. Returns JSON. `AppError` has an `IntoResponse` impl here mapping each variant to a status (`BadRequest`/`Parse` → 400, `NotFound` → 404, `Conflict` → 409, `Io`/`Llm` → 500), so handlers can `?` errors directly. Cards serialize in full. See [api.md](api.md) for the full contract and per-endpoint flows.
+Axum router + handlers over `AppState { llm, store, scheduler }`. Endpoints built: `/health`, `POST /ingest`, `GET /cards/pending`, `GET /cards/due`, `POST /reviews`, `POST /cards/{id}/accept`, `POST /cards/{id}/reject`, `PATCH /cards/{id}`. Planned: `POST /reviews/evaluate` (LLM-graded free-text answer — see [api.md](api.md)). Returns JSON. `AppError` has an `IntoResponse` impl here mapping each variant to a status (`BadRequest`/`Parse` → 400, `NotFound` → 404, `Conflict` → 409, `Io`/`Llm` → 500, `Unavailable` → 503 for transient LLM failures on evaluate), so handlers can `?` errors directly. Cards serialize in full. See [api.md](api.md) for the full contract and per-endpoint flows.
 
 ### `error` (`src/error.rs`) — built
 
@@ -136,7 +138,7 @@ pub trait Repository: Send + Sync {
 }
 ```
 
-Every method maps to a documented call site in [api.md](api.md); nothing speculative. Async to match `LlmProvider` (the other I/O trait) and to let an async `sqlx` backend drop in unchanged. Deliberately omitted for now (YAGNI): single-card `get` (the file backend reads-to-write, so `update_content` enforces the `Pending`-only guard in place), `Note`-metadata persistence and by-`source_file` lookups (watcher-reconciliation needs, added when the watcher lands), and any `delete` (cards are flagged, never removed).
+Every method maps to a documented call site in [api.md](api.md); nothing speculative. Async to match `LlmProvider` (the other I/O trait) and to let an async `sqlx` backend drop in unchanged. Deliberately omitted for now (YAGNI): single-card `get` — the file backend reads-to-write so `update_content` enforces the `Pending`-only guard in place, but `POST /reviews/evaluate` will need it (added when that endpoint lands). `Note`-metadata persistence and by-`source_file` lookups (watcher-reconciliation needs, added when the watcher lands), and any `delete` (cards are flagged, never removed).
 
 **v1 backend: files, not a database.** The store holds *derived* data — cards and SRS state are generated, not authored; the markdown vault stays the source of truth for notes. The store lives in a **configured server data dir** (`store.data_dir` in `studybuddy.toml`, default `./studybuddy-data`), independent of any vault — one store per server. At single-user scale a file backend is enough, stays inspectable, and avoids a DB dependency. Directly under the data dir:
 
@@ -181,8 +183,8 @@ Per-endpoint flows live in [api.md](api.md). The main one — `POST /ingest` —
 | model, error | done |
 | scheduler (SM-2) | done |
 | ingest | done — `ingest_text` (content→chunks); 24 unit tests |
-| api | full HTTP surface: `/health`, content-based `POST /ingest`, curation (`/cards/pending`, accept/reject, `PATCH`) + review (`/cards/due`, `POST /reviews`); 15 integration tests |
-| wire + client | shared DTOs + typed `reqwest` client; `wiremock` unit tests + `tests/client.rs` lifecycle vs a real spawned server |
+| api | full HTTP surface: `/health`, content-based `POST /ingest`, curation (`/cards/pending`, accept/reject, `PATCH`) + review (`/cards/due`, `POST /reviews`); 15 integration tests. `POST /reviews/evaluate` planned |
+| wire + client | shared DTOs + typed `reqwest` client; `wiremock` unit tests + `tests/client.rs` lifecycle vs a real spawned server. `EvaluateRequest`/`EvaluateResponse` DTOs planned |
 | cli (`sb`) | `push`/`curate`/`review` over the client (injected-I/O logic in `cli.rs`, clap shell in `bin/sb.rs`); `tests/cli.rs` acceptance |
 | config | `src/config.rs` — `[server]`, `[store]`, `[llm]` sections; `STUDYBUDDY_CONFIG` env override; deny-unknown-fields; 5 unit tests |
 | llm | trait + types + `OllamaProvider` + `RetryingProvider` + prompt builder; config-file wired; cloud providers not built |

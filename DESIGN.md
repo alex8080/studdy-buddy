@@ -123,6 +123,26 @@ The server exposes a `GET /cards/due` endpoint that returns the cards due now.
 Frontends decide when and how to surface them — daily session, on-demand,
 browser notifications, etc.
 
+**Free-text answer evaluation (web UI).** The web frontend lets the user type a
+free-text answer before seeing the correct one. When the user types anything and
+clicks "Submit", the client calls `POST /reviews/evaluate { card_id,
+user_answer }`. The server evaluates based on card type:
+
+- **Q&A cards** — LLM compares the user's answer to the card back, evaluating
+  for conceptual equivalence (not exact wording). The LLM prompt is anchored to
+  the card's expected answer, not its own world knowledge.
+- **Cloze cards** — deterministic fuzzy match against the cloze fill(s); no LLM
+  call.
+
+While evaluating, the answer stays hidden and the rating buttons are disabled.
+On success the frontend reveals the correct answer, shows the verdict (`correct`
+/ `partial` / `incorrect`) and an explanation, and pre-highlights the suggested
+rating button — but the user always makes the final rating call via `POST
+/reviews`. If the LLM evaluation fails (Q&A only), the frontend shows an error
+message and enables all rating buttons without a suggestion so the session can
+continue unblocked. If the user skips typing and clicks "Reveal" directly, the
+evaluate step is omitted and the user self-rates as usual.
+
 ### 4. Note sync (reconciliation)
 
 The watcher feeder watches the source directory and pushes changes; the server
@@ -144,6 +164,7 @@ This keeps cards trustworthy without surprising the user with silent deletions.
 | Card format | Both Q&A and cloze; LLM picks per card | Best learning outcome; small UI cost to render two types. |
 | SRS algorithm | **SM-2** for v1, behind a `Scheduler` interface | Simple, debuggable; FSRS can drop in once we have review data. |
 | Rating type | `Rating { Again, Hard, Good, Easy }` | Matches Anki UI labels and the `fsrs-rs` crate's enum; keeps the FSRS swap trivial. `Again` is technically on a different axis than the other three (recall-or-not vs. how-well), but ecosystem alignment wins over semantic purity. |
+| Answer evaluation | **Q&A cards**: LLM-graded via `POST /reviews/evaluate`; prompt anchored to card back (not world knowledge), evaluates conceptual equivalence. **Cloze cards**: deterministic fuzzy match on the fill — no LLM. Returns verdict + suggested rating, never forces it. | LLM is warranted only for free-text Q&A answers where paraphrase detection matters; cloze fills are short and specific enough for string matching. Gives the user a nudge without removing agency. Evaluate step is optional; clients that skip it (CLI, direct reveal) use the four-button self-rate flow as before. |
 | Card ↔ source | Every card stores `(file, heading)` anchor | Cheap now, painful to retrofit. |
 | Sync | A separate watcher feeder watches the vault and pushes changes; the server reconciles, flagging orphans/stale, never auto-deleting | Cards stay fresh without destroying user work. Because the server can't re-walk the disk, the feeder reports deletions/manifests — sync protocol deferred to the watcher build. |
 | Storage | v1: file-based behind a `Repository` trait in a configured server data dir — cards one-file-per-note (filename = `sha256(source_file)`), plus one `state.json` and one append-only `reviews.jsonl` | Store holds *derived* data at single-user scale; files stay inspectable, no DB dependency. The path arrives as untrusted input, so the sidecar name is hashed (flat, traversal-proof). Swap to SQLite/Postgres behind the trait if a multi-tenant hosted mode arrives. |

@@ -152,6 +152,70 @@ POST /reviews { card_id, rating }
 
 ---
 
+## `POST /reviews/evaluate` — planned
+
+Evaluate a user's free-text answer against a card before rating. Called by the
+web frontend when the user types an answer and clicks "Submit". The server asks
+the LLM to compare the user's answer to the card content and returns a verdict
+plus a suggested rating. The user always submits the final rating separately via
+`POST /reviews` — this endpoint is advisory only.
+
+**Request:**
+
+```json
+{ "card_id": "uuid", "user_answer": "The dot product of two vectors produces a scalar..." }
+```
+
+**Response 200:**
+
+```json
+{
+  "verdict": "correct",
+  "explanation": "The user correctly identified that the dot product produces a scalar result.",
+  "suggested_rating": "good"
+}
+```
+
+| Field | Values |
+|---|---|
+| `verdict` | `"correct"` / `"partial"` / `"incorrect"` |
+| `explanation` | Short LLM-generated rationale shown to the user |
+| `suggested_rating` | Default mapping: `correct → good`, `partial → hard`, `incorrect → again` |
+
+The suggested rating pre-highlights a button in the UI; the user may override it.
+
+**Errors:**
+
+- `404` — unknown `card_id`.
+- `503` — LLM call failed (`Transient` after retries exhausted, or `BadInput`). Body: `{ "error": "LLM evaluation unavailable: <reason>" }`. The frontend shows this message and enables all four rating buttons without a suggestion so the session continues.
+- `500` — `LlmError::Config` (misconfigured provider) or store I/O error.
+
+**Internal flow:**
+
+```
+POST /reviews/evaluate { card_id, user_answer }
+   │
+   ├─► store.get_card(card_id)                  → Card   (404 if absent)
+   ├─► match card.content {
+   │     Cloze → fuzzy_match(user_answer, cloze_fills) → EvaluationResult  // no LLM
+   │     Qa    → llm.evaluate_answer(&card, &user_answer) → EvaluationResult
+   │               Err(Transient(_)) / Err(BadInput(_))  → 503
+   │               Err(Config(_))                        → 500
+   │   }
+   └─► return { verdict, explanation, suggested_rating }
+```
+
+For Q&A evaluation the LLM prompt includes the card question, the expected
+answer, and the user's answer; the LLM is explicitly instructed to evaluate
+against the card's expected answer (not world knowledge) and to accept
+paraphrasing as correct.
+
+**Status:** planned. Requires `store.get_card` (single-card lookup, not yet on
+`Repository`), `LlmProvider::evaluate_answer` (Q&A only), and new wire DTOs
+(`EvaluateRequest` / `EvaluateResponse`).
+
+---
+
 ## Curation endpoints — built
 
 The flow that turns LLM-proposed cards into reviewable ones. `accept`, `reject`, and `PATCH` return `204 No Content` on success.
