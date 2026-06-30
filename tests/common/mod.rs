@@ -13,17 +13,19 @@ use std::sync::atomic::{AtomicUsize, Ordering};
 use async_trait::async_trait;
 use axum::Router;
 use studybuddy::api::{self, AppState};
-use studybuddy::llm::{ChunkContext, LlmError, LlmProvider, ProposedCard};
-use studybuddy::model::CardContent;
+use studybuddy::llm::{ChunkContext, EvaluationResult, LlmError, LlmProvider, ProposedCard};
+use studybuddy::model::{Card, CardContent, Verdict};
 use studybuddy::scheduler::Sm2;
 use studybuddy::store::{InMemoryRepository, Repository};
 
 type Respond = Box<dyn Fn(&ChunkContext) -> Result<Vec<ProposedCard>, LlmError> + Send + Sync>;
+type EvaluateRespond = Box<dyn Fn(&Card, &str) -> Result<EvaluationResult, LlmError> + Send + Sync>;
 
 /// A scriptable `LlmProvider` double: returns whatever its closure says and
 /// counts how many times it was asked to propose cards.
 pub struct FakeLlmProvider {
     respond: Respond,
+    evaluate: EvaluateRespond,
     calls: AtomicUsize,
 }
 
@@ -31,8 +33,21 @@ impl FakeLlmProvider {
     pub fn new(
         respond: impl Fn(&ChunkContext) -> Result<Vec<ProposedCard>, LlmError> + Send + Sync + 'static,
     ) -> Self {
+        Self::with_evaluate(respond, |_, _| {
+            Ok(EvaluationResult {
+                verdict: Verdict::Correct,
+                explanation: "FakeLlmProvider default: always correct".to_string(),
+            })
+        })
+    }
+
+    pub fn with_evaluate(
+        respond: impl Fn(&ChunkContext) -> Result<Vec<ProposedCard>, LlmError> + Send + Sync + 'static,
+        evaluate: impl Fn(&Card, &str) -> Result<EvaluationResult, LlmError> + Send + Sync + 'static,
+    ) -> Self {
         Self {
             respond: Box::new(respond),
+            evaluate: Box::new(evaluate),
             calls: AtomicUsize::new(0),
         }
     }
@@ -60,6 +75,14 @@ impl LlmProvider for FakeLlmProvider {
     async fn propose_cards(&self, chunk: &ChunkContext) -> Result<Vec<ProposedCard>, LlmError> {
         self.calls.fetch_add(1, Ordering::SeqCst);
         (self.respond)(chunk)
+    }
+
+    async fn evaluate_answer(
+        &self,
+        card: &Card,
+        user_answer: &str,
+    ) -> Result<EvaluationResult, LlmError> {
+        (self.evaluate)(card, user_answer)
     }
 }
 

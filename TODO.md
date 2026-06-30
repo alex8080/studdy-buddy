@@ -33,12 +33,12 @@ Discovery (`discover_notes`, `ingest_directory`) is built in `src/watcher.rs`. L
 
 ## Answer evaluation (`POST /reviews/evaluate`)
 
-Free-text answer grading via LLM during review. Design: [`DESIGN.md`](DESIGN.md) §3, [`docs/api.md`](docs/api.md#post-reviewsevaluate--planned).
+Free-text answer grading via LLM during review. Design: [`DESIGN.md`](DESIGN.md) §3, [`docs/api.md`](docs/api.md#post-reviewsevaluate--built).
 
-- [ ] `store::get_card` — single-card lookup on `Repository` trait (currently omitted as YAGNI; needed here).
-- [ ] `LlmProvider::evaluate_answer(card, user_answer) -> Result<EvaluationResult, LlmError>` — new trait method + prompt (Q&A only); impl for Ollama (and cloud providers when those land). Prompt must anchor the LLM to the card's expected answer, not world knowledge, and accept paraphrasing as correct.
-- [ ] `EvaluateRequest` / `EvaluateResponse` wire DTOs in `wire.rs`; `client.rs` method; integration tests.
-- [ ] `POST /reviews/evaluate` handler in `api.rs` — branch on card type: cloze → fuzzy match on fills (no LLM); Q&A → `llm.evaluate_answer`. 404 on unknown card, 503 on transient LLM failure (Q&A path only), 500 on config/IO error.
+- [x] `store::get_card` — single-card lookup on `Repository` trait (currently omitted as YAGNI; needed here).
+- [x] `LlmProvider::evaluate_answer(card, user_answer) -> Result<EvaluationResult, LlmError>` — new trait method + prompt (Q&A only); impl for Ollama (and cloud providers when those land). Prompt must anchor the LLM to the card's expected answer, not world knowledge, and accept paraphrasing as correct.
+- [x] `EvaluateRequest` / `EvaluateResponse` wire DTOs in `wire.rs`; `client.rs` method; integration tests.
+- [x] `POST /reviews/evaluate` handler in `api.rs` — branch on card type: cloze → fuzzy match on fills (no LLM); Q&A → `llm.evaluate_answer`. 404 on unknown card, 503 on transient LLM failure (Q&A path only), 500 on config/IO error.
 - [ ] Web UI changes: text area below question; "Reveal" → "Submit" when non-empty; evaluating state (answer hidden, buttons disabled); verdict + explanation display; suggested-rating pre-highlight; error message on 503.
 
 ## Later (post-v1, opt-in)

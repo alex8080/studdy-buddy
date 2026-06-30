@@ -6,7 +6,8 @@ use std::sync::Arc;
 use axum::body::{Body, to_bytes};
 use axum::http::{Request, StatusCode};
 use studybuddy::api::{self, AppState};
-use studybuddy::llm::{LlmError, LlmProvider};
+use studybuddy::llm::{EvaluationResult, LlmError, LlmProvider, ProposedCard};
+use studybuddy::model::{Card, CardContent, ClozeSpan, Verdict};
 use studybuddy::scheduler::Sm2;
 use studybuddy::store::{FileRepository, Repository};
 use tower::ServiceExt;
@@ -516,4 +517,185 @@ async fn unauthorized_response_includes_www_authenticate_header() {
         .unwrap();
     assert_eq!(res.status(), StatusCode::UNAUTHORIZED);
     assert_eq!(res.headers().get("www-authenticate").unwrap(), "Bearer");
+}
+
+// ---- POST /reviews/evaluate ----
+
+/// Build an app whose LLM always proposes one Q&A card and returns the given
+/// evaluate closure when grading answers.
+fn app_with_evaluate(
+    evaluate: impl Fn(&Card, &str) -> Result<EvaluationResult, LlmError> + Send + Sync + 'static,
+) -> axum::Router {
+    router(Arc::new(FakeLlmProvider::with_evaluate(
+        |_| {
+            Ok(vec![ProposedCard {
+                content: CardContent::Qa {
+                    front: "Q".into(),
+                    back: "A".into(),
+                },
+                rationale: None,
+            }])
+        },
+        evaluate,
+    )))
+}
+
+/// Build an app whose LLM proposes a single-span cloze card with a known fill.
+fn cloze_app() -> axum::Router {
+    router(Arc::new(FakeLlmProvider::new(|_| {
+        // "Paris" occupies bytes 25..30 in the text below.
+        Ok(vec![ProposedCard {
+            content: CardContent::Cloze {
+                text: "The capital of France is Paris.".into(),
+                spans: vec![ClozeSpan {
+                    start: 25,
+                    end: 30,
+                    hint: None,
+                }],
+            },
+            rationale: None,
+        }])
+    })))
+}
+
+#[tokio::test]
+async fn evaluate_unknown_card_is_404() {
+    let app = app_with_one_card();
+    let (status, _) = send(
+        &app,
+        "POST",
+        "/reviews/evaluate",
+        serde_json::json!({ "card_id": Uuid::new_v4().to_string(), "user_answer": "anything" }),
+    )
+    .await;
+    assert_eq!(status, StatusCode::NOT_FOUND);
+}
+
+#[tokio::test]
+async fn evaluate_qa_correct_verdict_returns_good_rating() {
+    let app = app_with_evaluate(|_, _| {
+        Ok(EvaluationResult {
+            verdict: Verdict::Correct,
+            explanation: "Correct.".into(),
+        })
+    });
+    let id = ingest_one_pending(&app, "test.md").await;
+    let (status, body) = send(
+        &app,
+        "POST",
+        "/reviews/evaluate",
+        serde_json::json!({ "card_id": id, "user_answer": "A" }),
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK);
+    assert_eq!(body["verdict"], "correct");
+    assert_eq!(body["suggested_rating"], "good");
+}
+
+#[tokio::test]
+async fn evaluate_qa_incorrect_verdict_returns_again_rating() {
+    let app = app_with_evaluate(|_, _| {
+        Ok(EvaluationResult {
+            verdict: Verdict::Incorrect,
+            explanation: "Wrong.".into(),
+        })
+    });
+    let id = ingest_one_pending(&app, "test.md").await;
+    let (status, body) = send(
+        &app,
+        "POST",
+        "/reviews/evaluate",
+        serde_json::json!({ "card_id": id, "user_answer": "wrong" }),
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK);
+    assert_eq!(body["verdict"], "incorrect");
+    assert_eq!(body["suggested_rating"], "again");
+}
+
+#[tokio::test]
+async fn evaluate_qa_partial_verdict_returns_hard_rating() {
+    let app = app_with_evaluate(|_, _| {
+        Ok(EvaluationResult {
+            verdict: Verdict::Partial,
+            explanation: "Partial.".into(),
+        })
+    });
+    let id = ingest_one_pending(&app, "test.md").await;
+    let (status, body) = send(
+        &app,
+        "POST",
+        "/reviews/evaluate",
+        serde_json::json!({ "card_id": id, "user_answer": "partial" }),
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK);
+    assert_eq!(body["verdict"], "partial");
+    assert_eq!(body["suggested_rating"], "hard");
+}
+
+#[tokio::test]
+async fn evaluate_qa_llm_transient_failure_is_503() {
+    let app = app_with_evaluate(|_, _| {
+        Err(LlmError::Transient {
+            reason: "timeout".into(),
+            retry_after: None,
+        })
+    });
+    let id = ingest_one_pending(&app, "test.md").await;
+    let (status, _) = send(
+        &app,
+        "POST",
+        "/reviews/evaluate",
+        serde_json::json!({ "card_id": id, "user_answer": "anything" }),
+    )
+    .await;
+    assert_eq!(status, StatusCode::SERVICE_UNAVAILABLE);
+}
+
+#[tokio::test]
+async fn evaluate_cloze_correct_answer_is_correct() {
+    let app = cloze_app();
+    let id = ingest_one_pending(&app, "test.md").await;
+    let (status, body) = send(
+        &app,
+        "POST",
+        "/reviews/evaluate",
+        serde_json::json!({ "card_id": id, "user_answer": "Paris" }),
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK);
+    assert_eq!(body["verdict"], "correct");
+    assert_eq!(body["suggested_rating"], "good");
+}
+
+#[tokio::test]
+async fn evaluate_cloze_wrong_answer_is_incorrect() {
+    let app = cloze_app();
+    let id = ingest_one_pending(&app, "test.md").await;
+    let (status, body) = send(
+        &app,
+        "POST",
+        "/reviews/evaluate",
+        serde_json::json!({ "card_id": id, "user_answer": "London" }),
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK);
+    assert_eq!(body["verdict"], "incorrect");
+    assert_eq!(body["suggested_rating"], "again");
+}
+
+#[tokio::test]
+async fn evaluate_cloze_case_insensitive_match_is_correct() {
+    let app = cloze_app();
+    let id = ingest_one_pending(&app, "test.md").await;
+    let (status, body) = send(
+        &app,
+        "POST",
+        "/reviews/evaluate",
+        serde_json::json!({ "card_id": id, "user_answer": "PARIS" }),
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK);
+    assert_eq!(body["verdict"], "correct");
 }

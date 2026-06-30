@@ -222,6 +222,17 @@ impl Repository for FileRepository {
         writeln!(f, "{line}")?;
         Ok(())
     }
+
+    async fn get_card(&self, card: CardId) -> Result<Card> {
+        let _guard = self.lock.lock().unwrap();
+        for path in list_sidecar_paths(&self.cards_dir())? {
+            let cards = read_cards(&path)?;
+            if let Some(c) = cards.into_iter().find(|c| c.id == card) {
+                return Ok(c);
+            }
+        }
+        Err(AppError::NotFound)
+    }
 }
 
 fn parse_err(e: serde_json::Error) -> AppError {

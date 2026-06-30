@@ -7,8 +7,8 @@ use std::sync::Arc;
 
 use studybuddy::cli;
 use studybuddy::client::Client;
-use studybuddy::llm::{LlmProvider, ProposedCard};
-use studybuddy::model::{CardContent, ClozeSpan};
+use studybuddy::llm::{EvaluationResult, LlmError, LlmProvider, ProposedCard};
+use studybuddy::model::{CardContent, ClozeSpan, Verdict};
 
 mod common;
 use common::{FakeLlmProvider, spawn_server};
@@ -16,6 +16,26 @@ use common::{FakeLlmProvider, spawn_server};
 const NOTE: &str = "# Vectors\n\nA vector has both magnitude and direction. \
 Adding two vectors places them tip to tail. The dot product multiplies \
 corresponding components and sums them into a scalar.\n";
+
+fn qa_llm(
+    evaluate: impl Fn(&studybuddy::model::Card, &str) -> Result<EvaluationResult, LlmError>
+    + Send
+    + Sync
+    + 'static,
+) -> Arc<dyn LlmProvider> {
+    Arc::new(common::FakeLlmProvider::with_evaluate(
+        |_| {
+            Ok(vec![ProposedCard {
+                content: CardContent::Qa {
+                    front: "Q".to_string(),
+                    back: "A".to_string(),
+                },
+                rationale: None,
+            }])
+        },
+        evaluate,
+    ))
+}
 
 /// Ingest `NOTE` then accept the single proposed card, leaving it due.
 async fn ingest_and_accept(client: &Client) {
@@ -201,4 +221,157 @@ async fn curate_edit_then_accept_persists_edit() {
         CardContent::Qa { front, .. } => assert_eq!(front, "edited front"),
         other => panic!("expected Qa, got {other:?}"),
     }
+}
+
+#[tokio::test]
+async fn review_qa_typed_correct_shows_verdict_and_suggested_rating() {
+    let client = Client::new(
+        spawn_server(qa_llm(|_, _| {
+            Ok(EvaluationResult {
+                verdict: Verdict::Correct,
+                explanation: "perfect paraphrase".to_string(),
+            })
+        }))
+        .await,
+    );
+    ingest_and_accept(&client).await;
+
+    // Type an answer, then rate with the suggested Good (3).
+    let mut input = Cursor::new(b"my answer\n3\n".to_vec());
+    let mut out = Vec::new();
+    cli::run_review(&client, &mut input, &mut out)
+        .await
+        .unwrap();
+
+    let printed = String::from_utf8(out).unwrap();
+    assert!(printed.contains("Correct"), "verdict shown: {printed}");
+    assert!(
+        printed.contains("perfect paraphrase"),
+        "explanation shown: {printed}"
+    );
+    assert!(
+        printed.contains("*3=good*"),
+        "suggested rating highlighted: {printed}"
+    );
+    assert!(
+        printed.contains("Expected: A"),
+        "expected answer revealed: {printed}"
+    );
+}
+
+#[tokio::test]
+async fn review_qa_typed_partially_correct_shows_verdict_and_suggested_rating() {
+    let client = Client::new(
+        spawn_server(qa_llm(|_, _| {
+            Ok(EvaluationResult {
+                verdict: Verdict::Partial,
+                explanation: "close but incomplete".to_string(),
+            })
+        }))
+        .await,
+    );
+    ingest_and_accept(&client).await;
+
+    // Partial maps to suggested Hard (2).
+    let mut input = Cursor::new(b"partial answer\n2\n".to_vec());
+    let mut out = Vec::new();
+    cli::run_review(&client, &mut input, &mut out)
+        .await
+        .unwrap();
+
+    let printed = String::from_utf8(out).unwrap();
+    assert!(printed.contains("Partial"), "verdict shown: {printed}");
+    assert!(
+        printed.contains("close but incomplete"),
+        "explanation shown: {printed}"
+    );
+    assert!(
+        printed.contains("*2=hard*"),
+        "suggested rating highlighted: {printed}"
+    );
+}
+
+#[tokio::test]
+async fn review_qa_typed_incorrect_shows_verdict_and_suggested_rating() {
+    let client = Client::new(
+        spawn_server(qa_llm(|_, _| {
+            Ok(EvaluationResult {
+                verdict: Verdict::Incorrect,
+                explanation: "not even close".to_string(),
+            })
+        }))
+        .await,
+    );
+    ingest_and_accept(&client).await;
+
+    // Incorrect maps to suggested Again (1).
+    let mut input = Cursor::new(b"wrong\n1\n".to_vec());
+    let mut out = Vec::new();
+    cli::run_review(&client, &mut input, &mut out)
+        .await
+        .unwrap();
+
+    let printed = String::from_utf8(out).unwrap();
+    assert!(printed.contains("Incorrect"), "verdict shown: {printed}");
+    assert!(
+        printed.contains("*1=again*"),
+        "suggested rating highlighted: {printed}"
+    );
+}
+
+#[tokio::test]
+async fn review_qa_empty_input_reveals_without_verdict() {
+    let llm: Arc<dyn LlmProvider> = Arc::new(FakeLlmProvider::always_one_card());
+    let client = Client::new(spawn_server(llm).await);
+    ingest_and_accept(&client).await;
+
+    // Empty line → reveal path: no verdict label, expected answer shown directly.
+    let mut input = Cursor::new(b"\n3\n".to_vec());
+    let mut out = Vec::new();
+    cli::run_review(&client, &mut input, &mut out)
+        .await
+        .unwrap();
+
+    let printed = String::from_utf8(out).unwrap();
+    assert!(printed.contains('A'), "answer revealed: {printed}");
+    assert!(
+        !printed.contains("Correct"),
+        "no verdict on reveal: {printed}"
+    );
+    assert!(
+        !printed.contains('*'),
+        "no suggested rating on reveal: {printed}"
+    );
+}
+
+#[tokio::test]
+async fn review_qa_evaluate_error_falls_back_to_reveal() {
+    let client = Client::new(
+        spawn_server(qa_llm(|_, _| {
+            Err(LlmError::Transient {
+                reason: "llm down".to_string(),
+                retry_after: None,
+            })
+        }))
+        .await,
+    );
+    ingest_and_accept(&client).await;
+
+    // Evaluate fails → error message shown, answer still revealed, rating still accepted.
+    let mut input = Cursor::new(b"my answer\n3\n".to_vec());
+    let mut out = Vec::new();
+    cli::run_review(&client, &mut input, &mut out)
+        .await
+        .unwrap();
+
+    let printed = String::from_utf8(out).unwrap();
+    assert!(
+        printed.contains("evaluation unavailable"),
+        "error surfaced: {printed}"
+    );
+    assert!(printed.contains('A'), "answer still revealed: {printed}");
+    assert!(
+        printed.contains("next due in"),
+        "review still recorded: {printed}"
+    );
 }

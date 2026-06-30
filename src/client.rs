@@ -14,8 +14,8 @@ use serde::de::DeserializeOwned;
 
 use crate::model::{Card, CardContent, CardId, Rating};
 use crate::wire::{
-    CardsResponse, ERROR_KEY, IngestRequest, IngestResponse, ReviewRequest, ReviewResponse,
-    UpdateContentRequest, path,
+    CardsResponse, ERROR_KEY, EvaluateRequest, EvaluateResponse, IngestRequest, IngestResponse,
+    ReviewRequest, ReviewResponse, UpdateContentRequest, path,
 };
 
 /// A handle to a running StudyBuddy server.
@@ -126,6 +126,21 @@ impl Client {
         empty_or_err(resp).await
     }
 
+    /// `POST /reviews/evaluate` — grade a free-text answer against a card.
+    pub async fn evaluate(&self, card_id: CardId, user_answer: &str) -> Result<EvaluateResponse> {
+        let req = EvaluateRequest {
+            card_id,
+            user_answer: user_answer.to_string(),
+        };
+        let resp = self
+            .http
+            .post(self.url(path::REVIEWS_EVALUATE))
+            .json(&req)
+            .send()
+            .await?;
+        json_or_err(resp).await
+    }
+
     /// `POST /reviews` — record a review and get the next scheduling.
     pub async fn review(&self, card_id: CardId, rating: Rating) -> Result<ReviewResponse> {
         let req = ReviewRequest { card_id, rating };
@@ -191,6 +206,7 @@ pub fn validate_api_token(token: &str) -> anyhow::Result<()> {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::model::Verdict;
     use wiremock::matchers::{body_json, method, path};
     use wiremock::{Mock, MockServer, ResponseTemplate};
 
@@ -304,6 +320,56 @@ mod tests {
         let msg = err.to_string();
         assert!(msg.contains("404"), "{msg}");
         assert!(msg.contains("not found"), "{msg}");
+    }
+
+    #[tokio::test]
+    async fn evaluate_posts_request_and_parses_correct_verdict() {
+        let server = MockServer::start().await;
+        let id = uuid::Uuid::nil();
+        Mock::given(method("POST"))
+            .and(path("/reviews/evaluate"))
+            .and(body_json(serde_json::json!({
+                "card_id": id.to_string(),
+                "user_answer": "four"
+            })))
+            .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!({
+                "verdict": "correct",
+                "explanation": "Matches expected answer.",
+                "suggested_rating": "good"
+            })))
+            .mount(&server)
+            .await;
+
+        let client = Client::new(server.uri());
+        let resp = client.evaluate(id, "four").await.unwrap();
+        assert_eq!(
+            resp,
+            EvaluateResponse {
+                verdict: Verdict::Correct,
+                explanation: "Matches expected answer.".to_string(),
+                suggested_rating: Rating::Good,
+            }
+        );
+    }
+
+    #[tokio::test]
+    async fn evaluate_parses_incorrect_verdict() {
+        let server = MockServer::start().await;
+        let id = uuid::Uuid::nil();
+        Mock::given(method("POST"))
+            .and(path("/reviews/evaluate"))
+            .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!({
+                "verdict": "incorrect",
+                "explanation": "Wrong answer.",
+                "suggested_rating": "again"
+            })))
+            .mount(&server)
+            .await;
+
+        let client = Client::new(server.uri());
+        let resp = client.evaluate(id, "five").await.unwrap();
+        assert_eq!(resp.verdict, Verdict::Incorrect);
+        assert_eq!(resp.explanation, "Wrong answer.");
     }
 
     #[test]

@@ -2,7 +2,8 @@ use async_trait::async_trait;
 use std::time::Duration;
 use tokio::time::sleep;
 
-use crate::llm::{ChunkContext, LlmError, LlmProvider, ProposedCard};
+use crate::llm::{ChunkContext, EvaluationResult, LlmError, LlmProvider, ProposedCard};
+use crate::model::Card;
 
 #[derive(Debug, Clone)]
 pub struct RetryPolicy {
@@ -78,6 +79,42 @@ impl<P: LlmProvider> LlmProvider for RetryingProvider<P> {
             reason: "no attempts made".to_string(),
         }))
     }
+
+    async fn evaluate_answer(
+        &self,
+        card: &Card,
+        user_answer: &str,
+    ) -> Result<EvaluationResult, LlmError> {
+        let mut last_error = None;
+
+        for attempt in 0..self.policy.max_attempts {
+            match self.inner.evaluate_answer(card, user_answer).await {
+                Ok(result) => return Ok(result),
+                Err(LlmError::Transient {
+                    reason,
+                    retry_after,
+                }) => {
+                    last_error = Some(LlmError::Transient {
+                        reason,
+                        retry_after,
+                    });
+
+                    if attempt == self.policy.max_attempts - 1 {
+                        break;
+                    }
+
+                    let delay = retry_after.unwrap_or_else(|| self.policy.backoff_delay(attempt));
+                    sleep(delay).await;
+                }
+                Err(e @ LlmError::BadInput { .. }) => return Err(e),
+                Err(e @ LlmError::Config { .. }) => return Err(e),
+            }
+        }
+
+        Err(last_error.unwrap_or_else(|| LlmError::Config {
+            reason: "no attempts made".to_string(),
+        }))
+    }
 }
 
 #[cfg(test)]
@@ -122,6 +159,14 @@ mod tests {
                 .pop_front()
                 .unwrap_or(Ok(vec![]))
         }
+
+        async fn evaluate_answer(
+            &self,
+            _card: &Card,
+            _user_answer: &str,
+        ) -> Result<EvaluationResult, LlmError> {
+            unimplemented!("CountingMock::evaluate_answer not used in retry tests")
+        }
     }
 
     struct TimestampedMock {
@@ -154,6 +199,14 @@ mod tests {
                 .unwrap()
                 .pop_front()
                 .unwrap_or(Ok(vec![]))
+        }
+
+        async fn evaluate_answer(
+            &self,
+            _card: &Card,
+            _user_answer: &str,
+        ) -> Result<EvaluationResult, LlmError> {
+            unimplemented!("TimestampedMock::evaluate_answer not used in retry tests")
         }
     }
 

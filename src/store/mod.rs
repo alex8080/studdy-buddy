@@ -72,4 +72,8 @@ pub trait Repository: Send + Sync {
 
     /// Append a review to the durable log. Used by `POST /reviews`.
     async fn save_review(&self, review: &Review) -> Result<()>;
+
+    /// Look up a single card by id. Returns [`AppError::NotFound`] if no card
+    /// with that id exists. Used by `POST /reviews/evaluate`.
+    async fn get_card(&self, card: CardId) -> Result<Card>;
 }

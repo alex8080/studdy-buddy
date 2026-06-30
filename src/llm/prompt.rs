@@ -1,5 +1,22 @@
 use crate::llm::ChunkContext;
 
+pub const EVALUATE_SYSTEM_PROMPT: &str = "\
+You grade a student's answer to a flashcard question. \
+Judge only against the expected answer — do not apply world knowledge. \
+Accept paraphrasing and semantically equivalent expressions as correct. \
+A partial answer covers some but not all key points. \
+Ignore minor differences in phrasing, capitalization, or punctuation.
+
+Respond with JSON:
+{
+  \"verdict\": \"<correct|partial|incorrect>\",
+  \"explanation\": \"<one sentence explaining the verdict>\"
+}";
+
+pub fn render_evaluate_user(front: &str, back: &str, user_answer: &str) -> String {
+    format!("Question: {front}\nExpected answer: {back}\nStudent's answer: {user_answer}")
+}
+
 pub const SYSTEM_PROMPT: &str = "\
 You author concise flashcards from study material. Given a chunk of source text, \
 produce 1-5 self-contained Q&A cards.
@@ -94,5 +111,23 @@ mod tests {
     fn joins_multiple_tags_with_comma_space() {
         let out = render_user(&chunk(None, &["a", "b", "c"], "x"));
         assert!(out.contains("Tags: a, b, c\n"), "got: {out:?}");
+    }
+
+    #[test]
+    fn evaluate_user_renders_all_three_fields() {
+        let out = render_evaluate_user("What is 2+2?", "4", "four");
+        assert_eq!(
+            out,
+            "Question: What is 2+2?\nExpected answer: 4\nStudent's answer: four"
+        );
+    }
+
+    #[test]
+    fn evaluate_user_preserves_whitespace_in_answer() {
+        let out = render_evaluate_user("Q", "A", "  multi word  ");
+        assert!(
+            out.ends_with("Student's answer:   multi word  "),
+            "got: {out:?}"
+        );
     }
 }

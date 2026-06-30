@@ -11,7 +11,7 @@
 use chrono::{DateTime, Utc};
 use serde::{Deserialize, Serialize};
 
-use crate::model::{Card, CardContent, CardId, Rating};
+use crate::model::{Card, CardContent, CardId, Rating, Verdict};
 
 /// JSON key carrying the message in a non-2xx error body (`{ "error": "..." }`).
 /// Written by the server, read by the client.
@@ -26,6 +26,7 @@ pub mod path {
     pub const CARDS_PENDING: &str = "/cards/pending";
     pub const CARDS_DUE: &str = "/cards/due";
     pub const REVIEWS: &str = "/reviews";
+    pub const REVIEWS_EVALUATE: &str = "/reviews/evaluate";
 }
 
 /// `POST /ingest` request — one pushed note: its vault-relative path and raw
@@ -70,4 +71,19 @@ pub struct ReviewRequest {
 pub struct ReviewResponse {
     pub next_due: DateTime<Utc>,
     pub interval_days: u32,
+}
+
+/// `POST /reviews/evaluate` request — a student's free-text answer to a card.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct EvaluateRequest {
+    pub card_id: CardId,
+    pub user_answer: String,
+}
+
+/// `POST /reviews/evaluate` response — LLM or fuzzy-match verdict.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct EvaluateResponse {
+    pub verdict: Verdict,
+    pub explanation: String,
+    pub suggested_rating: Rating,
 }

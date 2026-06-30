@@ -17,12 +17,12 @@ use uuid::Uuid;
 use crate::error::AppError;
 use crate::ingest::{ChunkConfig, ingest_text};
 use crate::llm::{ChunkContext, LlmError, LlmProvider, ProposedCard};
-use crate::model::{Card, CardId, CardStatus, Review};
+use crate::model::{Card, CardContent, CardId, CardStatus, Rating, Review, Verdict};
 use crate::scheduler::{Scheduler, SchedulerState};
 use crate::store::Repository;
 use crate::wire::{
-    CardsResponse, ERROR_KEY, IngestRequest, IngestResponse, ReviewRequest, ReviewResponse,
-    UpdateContentRequest, path,
+    CardsResponse, ERROR_KEY, EvaluateRequest, EvaluateResponse, IngestRequest, IngestResponse,
+    ReviewRequest, ReviewResponse, UpdateContentRequest, path,
 };
 
 #[derive(Clone)]
@@ -42,6 +42,7 @@ pub fn router(state: AppState) -> Router {
         .route("/cards/{id}/reject", post(reject_card))
         .route("/cards/{id}", patch(patch_card))
         .route(path::REVIEWS, post(post_review))
+        .route(path::REVIEWS_EVALUATE, post(post_evaluate))
         .route_layer(from_fn_with_state(state.clone(), require_bearer));
 
     Router::new()
@@ -247,6 +248,94 @@ async fn post_review(
     }))
 }
 
+/// `POST /reviews/evaluate` — grade a free-text answer against a card.
+///
+/// Cloze cards use case-insensitive fuzzy matching against the fill text (no
+/// LLM call). Q&A cards are graded by the LLM. Transient and bad-input LLM
+/// failures map to 503 so the client can retry; config failures map to 500.
+async fn post_evaluate(
+    State(state): State<AppState>,
+    Json(req): Json<EvaluateRequest>,
+) -> Result<Json<EvaluateResponse>, AppError> {
+    let card = state.store.get_card(req.card_id).await?;
+
+    let (verdict, explanation) = match &card.content {
+        CardContent::Cloze { text, spans } => cloze_verdict(text, spans, &req.user_answer),
+        CardContent::Qa { .. } => {
+            let result = state
+                .llm
+                .evaluate_answer(&card, &req.user_answer)
+                .await
+                .map_err(|e| match e {
+                    LlmError::Transient { reason, .. } | LlmError::BadInput { reason } => {
+                        AppError::LlmUnavailable(reason)
+                    }
+                    LlmError::Config { reason } => AppError::Llm(reason),
+                })?;
+            (result.verdict, result.explanation)
+        }
+    };
+
+    let suggested_rating = match verdict {
+        Verdict::Correct => Rating::Good,
+        Verdict::Partial => Rating::Hard,
+        Verdict::Incorrect => Rating::Again,
+    };
+
+    Ok(Json(EvaluateResponse {
+        verdict,
+        explanation,
+        suggested_rating,
+    }))
+}
+
+/// Fuzzy-match a cloze answer against the card's fill spans.
+///
+/// Single span: case-insensitive trimmed equality against the fill text.
+/// Multiple spans: every fill must appear (case-insensitive) as a substring
+/// of the answer — suitable for a single answer box listing all fills.
+fn cloze_verdict(
+    text: &str,
+    spans: &[crate::model::ClozeSpan],
+    user_answer: &str,
+) -> (Verdict, String) {
+    if spans.is_empty() {
+        return (
+            Verdict::Incorrect,
+            "No fill spans defined for this card.".into(),
+        );
+    }
+
+    let fills: Vec<&str> = spans
+        .iter()
+        .filter_map(|s| text.get(s.start..s.end))
+        .collect();
+
+    let answer_lower = user_answer.trim().to_lowercase();
+
+    let correct = if fills.len() == 1 {
+        fills[0].trim().to_lowercase() == answer_lower
+    } else {
+        fills
+            .iter()
+            .all(|f| answer_lower.contains(&f.trim().to_lowercase()))
+    };
+
+    if correct {
+        (Verdict::Correct, "Answer matches expected fill.".into())
+    } else if fills.len() == 1 {
+        (
+            Verdict::Incorrect,
+            format!("Expected '{}' but answer does not match.", fills[0].trim()),
+        )
+    } else {
+        (
+            Verdict::Incorrect,
+            "Not all expected fills were found in your answer.".into(),
+        )
+    }
+}
+
 /// The note path is untrusted HTTP input and becomes the card's `(source_file,
 /// source_heading)` anchor. The store hashes it for the on-disk filename, so
 /// this isn't the only traversal defense — but the anchor itself must stay a
@@ -274,6 +363,7 @@ impl IntoResponse for AppError {
             AppError::Parse(s) => (StatusCode::BAD_REQUEST, s),
             AppError::BadRequest(s) => (StatusCode::BAD_REQUEST, s),
             AppError::Conflict(s) => (StatusCode::CONFLICT, s),
+            AppError::LlmUnavailable(s) => (StatusCode::SERVICE_UNAVAILABLE, s),
             AppError::Unauthorized => {
                 let body = Json(serde_json::json!({ ERROR_KEY: "unauthorized" }));
                 let mut resp = (StatusCode::UNAUTHORIZED, body).into_response();

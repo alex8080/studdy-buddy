@@ -11,7 +11,7 @@ use std::path::Path;
 use anyhow::{Context, Result, anyhow, bail};
 
 use crate::client::Client;
-use crate::model::{CardContent, ClozeSpan, Rating};
+use crate::model::{CardContent, CardId, ClozeSpan, Rating, Verdict};
 
 /// `sb push` — push one note's markdown to the server for card generation.
 ///
@@ -92,31 +92,135 @@ pub async fn run_review(
             i + 1,
             render_question(&card.content)
         )?;
-        write!(out, "(press Enter to reveal) ")?;
-        out.flush()?;
-        let mut line = String::new();
-        input.read_line(&mut line)?;
-        writeln!(out, "{}", render_answer(&card.content))?;
 
-        let rating = loop {
-            write!(out, "rate [1=again 2=hard 3=good 4=easy]: ")?;
-            out.flush()?;
-            let mut key = String::new();
-            if input.read_line(&mut key)? == 0 {
+        let rating = match &card.content {
+            CardContent::Qa { back, .. } => {
+                evaluate_and_rate_qa(client, card.id, back, input, out).await?
+            }
+            CardContent::Cloze { text, .. } => reveal_and_rate_cloze(text, input, out)?,
+        };
+
+        match rating {
+            Some(r) => {
+                let outcome = client.review(card.id, r).await?;
+                writeln!(out, "  next due in {} day(s)", outcome.interval_days)?;
+            }
+            None => {
                 writeln!(out, "\ninput ended; stopping review")?;
                 return Ok(());
             }
-            if let Some(rating) = rating_from_key(&key) {
-                break rating;
-            }
-            writeln!(out, "  unrecognized — enter 1, 2, 3, or 4")?;
-        };
-
-        let outcome = client.review(card.id, rating).await?;
-        writeln!(out, "  next due in {} day(s)", outcome.interval_days)?;
+        }
     }
     writeln!(out, "\nreviewed {total} card(s)")?;
     Ok(())
+}
+
+/// Prompt for a free-text answer on a Q&A card, optionally evaluate it against
+/// the server, reveal the expected answer, then collect a rating.
+///
+/// Returns `None` on EOF, signalling the caller to stop the session.
+async fn evaluate_and_rate_qa(
+    client: &Client,
+    card_id: CardId,
+    back: &str,
+    input: &mut impl BufRead,
+    out: &mut impl Write,
+) -> Result<Option<Rating>> {
+    write!(out, "your answer (or Enter to reveal): ")?;
+    out.flush()?;
+    let mut answer = String::new();
+    input.read_line(&mut answer)?;
+
+    let suggested = if !answer.trim().is_empty() {
+        match client.evaluate(card_id, answer.trim()).await {
+            Ok(eval) => {
+                writeln!(
+                    out,
+                    "  {} — {}",
+                    verdict_label(eval.verdict),
+                    eval.explanation
+                )?;
+                writeln!(out, "  Expected: {back}")?;
+                Some(eval.suggested_rating)
+            }
+            Err(e) => {
+                writeln!(out, "  evaluation unavailable: {e}")?;
+                writeln!(out, "{back}")?;
+                None
+            }
+        }
+    } else {
+        writeln!(out, "{back}")?;
+        None
+    };
+
+    read_rating(input, out, suggested)
+}
+
+/// Reveal a cloze card's filled text on Enter, then collect a rating.
+///
+/// Returns `None` on EOF, signalling the caller to stop the session.
+fn reveal_and_rate_cloze(
+    text: &str,
+    input: &mut impl BufRead,
+    out: &mut impl Write,
+) -> Result<Option<Rating>> {
+    write!(out, "(press Enter to reveal) ")?;
+    out.flush()?;
+    let mut line = String::new();
+    input.read_line(&mut line)?;
+    writeln!(out, "{text}")?;
+    read_rating(input, out, None)
+}
+
+/// Read a rating keystroke in a loop, returning `None` on EOF.
+fn read_rating(
+    input: &mut impl BufRead,
+    out: &mut impl Write,
+    suggested: Option<Rating>,
+) -> Result<Option<Rating>> {
+    loop {
+        write!(out, "{}", rating_prompt(suggested))?;
+        out.flush()?;
+        let mut key = String::new();
+        if input.read_line(&mut key)? == 0 {
+            return Ok(None);
+        }
+        if let Some(rating) = rating_from_key(&key) {
+            return Ok(Some(rating));
+        }
+        writeln!(out, "  unrecognized — enter 1, 2, 3, or 4")?;
+    }
+}
+
+/// Rating prompt string, with the suggested rating wrapped in `*...*`.
+fn rating_prompt(suggested: Option<Rating>) -> String {
+    let labels: &[(Rating, &str)] = &[
+        (Rating::Again, "1=again"),
+        (Rating::Hard, "2=hard"),
+        (Rating::Good, "3=good"),
+        (Rating::Easy, "4=easy"),
+    ];
+    let parts: Vec<String> = labels
+        .iter()
+        .map(|(r, label)| {
+            if suggested == Some(*r) {
+                format!("*{label}*")
+            } else {
+                (*label).to_string()
+            }
+        })
+        .collect();
+    format!("rate [{}]: ", parts.join(" "))
+}
+
+/// Human-readable label for an evaluation verdict.
+fn verdict_label(v: Verdict) -> &'static str {
+    match v {
+        Verdict::Correct => "Correct",
+        Verdict::Partial => "Partial",
+        Verdict::Incorrect => "Incorrect",
+    }
 }
 
 /// `sb curate` — walk the pending cards, accepting/rejecting/editing each.
@@ -220,14 +324,6 @@ fn render_question(content: &CardContent) -> String {
     }
 }
 
-/// The answer side: the Q&A back, or the cloze text with its spans filled in.
-fn render_answer(content: &CardContent) -> String {
-    match content {
-        CardContent::Qa { back, .. } => back.clone(),
-        CardContent::Cloze { text, .. } => text.clone(),
-    }
-}
-
 /// Render cloze `text` with each span replaced by a `{{...}}` blank (carrying
 /// its hint when present). Spans are taken in `start` order; malformed or
 /// overlapping spans are skipped rather than panicking.
@@ -315,5 +411,25 @@ mod tests {
             render_cloze_blanked(text, &spans).contains("{{...: energy}}"),
             "hint should appear in the blank"
         );
+    }
+
+    #[test]
+    fn verdict_label_maps_all_variants() {
+        assert_eq!(verdict_label(Verdict::Correct), "Correct");
+        assert_eq!(verdict_label(Verdict::Partial), "Partial");
+        assert_eq!(verdict_label(Verdict::Incorrect), "Incorrect");
+    }
+
+    #[test]
+    fn rating_prompt_marks_suggested_rating() {
+        assert!(rating_prompt(Some(Rating::Good)).contains("*3=good*"));
+        assert!(!rating_prompt(Some(Rating::Good)).contains("*1=again*"));
+    }
+
+    #[test]
+    fn rating_prompt_unmodified_when_no_suggestion() {
+        let prompt = rating_prompt(None);
+        assert!(prompt.contains("1=again"));
+        assert!(!prompt.contains('*'));
     }
 }

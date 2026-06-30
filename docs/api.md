@@ -152,7 +152,7 @@ POST /reviews { card_id, rating }
 
 ---
 
-## `POST /reviews/evaluate` — planned
+## `POST /reviews/evaluate` — built
 
 Evaluate a user's free-text answer against a card before rating. Called by the
 web frontend when the user types an answer and clicks "Submit". The server asks
@@ -210,9 +210,9 @@ answer, and the user's answer; the LLM is explicitly instructed to evaluate
 against the card's expected answer (not world knowledge) and to accept
 paraphrasing as correct.
 
-**Status:** planned. Requires `store.get_card` (single-card lookup, not yet on
-`Repository`), `LlmProvider::evaluate_answer` (Q&A only), and new wire DTOs
-(`EvaluateRequest` / `EvaluateResponse`).
+**Status:** built. `store.get_card`, `LlmProvider::evaluate_answer`, wire DTOs,
+and the handler are all implemented. Cloze uses fuzzy match; Q&A uses the LLM.
+Integration tests in `tests/api.rs`.
 
 ---
 

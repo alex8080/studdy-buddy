@@ -91,16 +91,16 @@ LlmProvider::evaluate_answer(card: &Card, user_answer: &str) -> Result<Evaluatio
 |---|---|
 | `ChunkContext { source_file, source_heading, tags, text }` | LLM input — produced by `ingest` |
 | `ProposedCard { content, rationale }` | LLM output — goes into the pending-review queue |
-| `EvaluationResult { verdict, explanation, suggested_rating }` | LLM output for `POST /reviews/evaluate` — verdict is `correct`/`partial`/`incorrect` |
+| `EvaluationResult { verdict: Verdict, explanation }` | LLM output for Q&A grading — `Verdict` is `correct`/`partial`/`incorrect` |
 | `LlmError::{Transient, BadInput, Config}` | Provider failure classified by recovery action |
 
 A `RetryingProvider<P>` decorator handles `Transient` retries once for all providers — concrete impls (`llm::ollama` first, then `llm::anthropic` / `llm::openai`) only need to make one attempt and classify the error. Prompt text lives in `src/llm/prompt.rs` so it can be iterated without recompiling the rest of the server.
 
-Concrete providers are **not** yet built. See [llm.md](llm.md) for the full design — error taxonomy, retry decorator, Ollama specifics, config-file shape, and the testing strategy.
+Cloud providers (`llm::anthropic`, `llm::openai`) are **not** yet built. See [llm.md](llm.md) for the full design — error taxonomy, retry decorator, Ollama specifics, config-file shape, and the testing strategy.
 
-### `api` (`src/api.rs`) — built (+ one endpoint planned)
+### `api` (`src/api.rs`) — built
 
-Axum router + handlers over `AppState { llm, store, scheduler }`. Endpoints built: `/health`, `POST /ingest`, `GET /cards/pending`, `GET /cards/due`, `POST /reviews`, `POST /cards/{id}/accept`, `POST /cards/{id}/reject`, `PATCH /cards/{id}`. Planned: `POST /reviews/evaluate` (LLM-graded free-text answer — see [api.md](api.md)). Returns JSON. `AppError` has an `IntoResponse` impl here mapping each variant to a status (`BadRequest`/`Parse` → 400, `NotFound` → 404, `Conflict` → 409, `Io`/`Llm` → 500, `Unavailable` → 503 for transient LLM failures on evaluate), so handlers can `?` errors directly. Cards serialize in full. See [api.md](api.md) for the full contract and per-endpoint flows.
+Axum router + handlers over `AppState { llm, store, scheduler }`. Endpoints built: `/health`, `POST /ingest`, `GET /cards/pending`, `GET /cards/due`, `POST /reviews`, `POST /cards/{id}/accept`, `POST /cards/{id}/reject`, `PATCH /cards/{id}`, `POST /reviews/evaluate` (LLM-graded free-text answer — see [api.md](api.md)). Returns JSON. `AppError` has an `IntoResponse` impl here mapping each variant to a status (`BadRequest`/`Parse` → 400, `NotFound` → 404, `Conflict` → 409, `Io`/`Llm` → 500, `LlmUnavailable` → 503 for transient LLM failures on evaluate), so handlers can `?` errors directly. Cards serialize in full. See [api.md](api.md) for the full contract and per-endpoint flows.
 
 ### `error` (`src/error.rs`) — built
 
@@ -114,6 +114,7 @@ Crate-wide `AppError` and `Result<T> = std::result::Result<T, AppError>`.
 | `Parse(String)` | Frontmatter YAML errors → 400 |
 | `BadRequest(String)` | Invalid input (e.g. bad `source_file`) → 400 |
 | `Conflict(String)` | State conflict (e.g. editing a non-`Pending` card) → 409 |
+| `LlmUnavailable(String)` | Transient or bad-input LLM failure on evaluate → 503 |
 
 ### `store` — built (in-memory + file backend)
 
@@ -135,10 +136,13 @@ pub trait Repository: Send + Sync {
     async fn load_state(&self, card: CardId) -> Result<SchedulerState>;
     async fn save_state(&self, card: CardId, state: SchedulerState, next_due: DateTime<Utc>) -> Result<()>;
     async fn save_review(&self, review: &Review) -> Result<()>;
+
+    // evaluate — single-card lookup for POST /reviews/evaluate
+    async fn get_card(&self, card: CardId) -> Result<Card>;
 }
 ```
 
-Every method maps to a documented call site in [api.md](api.md); nothing speculative. Async to match `LlmProvider` (the other I/O trait) and to let an async `sqlx` backend drop in unchanged. Deliberately omitted for now (YAGNI): single-card `get` — the file backend reads-to-write so `update_content` enforces the `Pending`-only guard in place, but `POST /reviews/evaluate` will need it (added when that endpoint lands). `Note`-metadata persistence and by-`source_file` lookups (watcher-reconciliation needs, added when the watcher lands), and any `delete` (cards are flagged, never removed).
+Every method maps to a documented call site in [api.md](api.md); nothing speculative. Async to match `LlmProvider` (the other I/O trait) and to let an async `sqlx` backend drop in unchanged. Deliberately omitted for now (YAGNI): `Note`-metadata persistence and by-`source_file` lookups (watcher-reconciliation needs, added when the watcher lands), and any `delete` (cards are flagged, never removed).
 
 **v1 backend: files, not a database.** The store holds *derived* data — cards and SRS state are generated, not authored; the markdown vault stays the source of truth for notes. The store lives in a **configured server data dir** (`store.data_dir` in `studybuddy.toml`, default `./studybuddy-data`), independent of any vault — one store per server. At single-user scale a file backend is enough, stays inspectable, and avoids a DB dependency. Directly under the data dir:
 
@@ -152,7 +156,7 @@ We deliberately do **not** shard SRS state by the user's directory structure. Th
 
 ### `client` (`src/client.rs`) + `wire` (`src/wire.rs`) — built
 
-`wire.rs` holds the HTTP request/response DTOs (`IngestRequest`/`IngestResponse`, `CardsResponse`, `ReviewRequest`/`ReviewResponse`, `UpdateContentRequest`) shared by the server handlers and the client, so the contract has one definition and can't drift. `client.rs` is a typed `reqwest` wrapper — one async method per endpoint (`ingest`/`pending`/`due`/`accept`/`reject`/`patch`/`review`), with response/error handling factored into `json_or_err`/`empty_or_err`/`error_from`. It holds no domain logic and is the single place anything talks to the server. Tested with `wiremock` unit tests plus `tests/client.rs` (the lifecycle against a real spawned server — the wire-contract test).
+`wire.rs` holds the HTTP request/response DTOs (`IngestRequest`/`IngestResponse`, `CardsResponse`, `ReviewRequest`/`ReviewResponse`, `UpdateContentRequest`, `EvaluateRequest`/`EvaluateResponse`) shared by the server handlers and the client, so the contract has one definition and can't drift. `client.rs` is a typed `reqwest` wrapper — one async method per endpoint (`ingest`/`pending`/`due`/`accept`/`reject`/`patch`/`review`/`evaluate`), with response/error handling factored into `json_or_err`/`empty_or_err`/`error_from`. It holds no domain logic and is the single place anything talks to the server. Tested with `wiremock` unit tests plus `tests/client.rs` (the lifecycle against a real spawned server — the wire-contract test).
 
 ### `cli` (`src/cli.rs`) + `sb` (`src/bin/sb.rs`) — built
 
@@ -183,12 +187,12 @@ Per-endpoint flows live in [api.md](api.md). The main one — `POST /ingest` —
 | model, error | done |
 | scheduler (SM-2) | done |
 | ingest | done — `ingest_text` (content→chunks); 24 unit tests |
-| api | full HTTP surface: `/health`, content-based `POST /ingest`, curation (`/cards/pending`, accept/reject, `PATCH`) + review (`/cards/due`, `POST /reviews`); 15 integration tests. `POST /reviews/evaluate` planned |
-| wire + client | shared DTOs + typed `reqwest` client; `wiremock` unit tests + `tests/client.rs` lifecycle vs a real spawned server. `EvaluateRequest`/`EvaluateResponse` DTOs planned |
+| api | full HTTP surface: `/health`, content-based `POST /ingest`, curation (`/cards/pending`, accept/reject, `PATCH`) + review (`/cards/due`, `POST /reviews`) + `POST /reviews/evaluate`; 28 integration tests |
+| wire + client | shared DTOs + typed `reqwest` client; `wiremock` unit tests + `tests/client.rs` lifecycle vs a real spawned server |
 | cli (`sb`) | `push`/`curate`/`review` over the client (injected-I/O logic in `cli.rs`, clap shell in `bin/sb.rs`); `tests/cli.rs` acceptance |
 | config | `src/config.rs` — `[server]`, `[store]`, `[llm]` sections; `STUDYBUDDY_CONFIG` env override; deny-unknown-fields; 5 unit tests |
-| llm | trait + types + `OllamaProvider` + `RetryingProvider` + prompt builder; config-file wired; cloud providers not built |
-| store | `Repository` trait + in-memory (10 unit) + file backend (6 acceptance), sha256 sidecars under the data dir; wired into `AppState` |
+| llm | `LlmProvider` trait (`propose_cards`, `evaluate_answer`) + `Verdict` + `EvaluationResult`; `OllamaProvider` + `RetryingProvider` + prompt builder; config-file wired; cloud providers not built |
+| store | `Repository` trait (incl. `get_card`) + in-memory (10 unit) + file backend (8 acceptance), sha256 sidecars under the data dir; wired into `AppState` |
 | watcher | feeder binary pushes a vault via `Client::ingest` (`discover_notes`); walkers in `src/watcher.rs`, 11 acceptance tests. Change-detection + `notify` live-watching + reconciliation not yet built |
 
-Next planned steps: concrete cloud `LlmProvider` impls (design in [llm.md](llm.md)), then the watcher's change detection + `notify` live-watching + reconciliation protocol (the feeder reports deletions/manifests so the server can flag orphans/stale).
+Next planned steps: web UI for answer evaluation (last open task in `TODO.md`), then concrete cloud `LlmProvider` impls (design in [llm.md](llm.md)), then the watcher's change detection + `notify` live-watching + reconciliation protocol (the feeder reports deletions/manifests so the server can flag orphans/stale).

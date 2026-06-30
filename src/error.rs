@@ -14,6 +14,8 @@ pub enum AppError {
     BadRequest(String),
     #[error("conflict: {0}")]
     Conflict(String),
+    #[error("llm unavailable: {0}")]
+    LlmUnavailable(String),
     #[error("unauthorized")]
     Unauthorized,
 }

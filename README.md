@@ -2,7 +2,7 @@
 
 A self-hosted local HTTP server that ingests your markdown notes (Obsidian-compatible), uses an LLM to propose flashcards, lets you curate them, and schedules reviews with spaced repetition. Backend-first: future frontends are clients of the HTTP API.
 
-> **Status:** early implementation. The full HTTP surface is up and tested — `POST /ingest` (push a note → LLM proposes cards), curation (`/cards/pending`, accept/reject, edit), and review (`/cards/due`, `/reviews`) backed by an SM-2 scheduler and a file store. An `sb` CLI drives all of it (see below), and the `watcher` pushes a vault to the server. Concrete cloud LLM providers and the watcher's change-detection / live-watching are still to come. See [`DESIGN.md`](DESIGN.md) and [`docs/`](docs/).
+> **Status:** early implementation. The full HTTP surface is up and tested — `POST /ingest` (push a note → LLM proposes cards), curation (`/cards/pending`, accept/reject, edit), review (`/cards/due`, `/reviews`), and LLM-graded free-text answer evaluation (`POST /reviews/evaluate`) — all backed by an SM-2 scheduler and a file store. An `sb` CLI drives all of it (see below), and the `watcher` pushes a vault to the server. Concrete cloud LLM providers and the watcher's change-detection / live-watching are still to come. See [`DESIGN.md`](DESIGN.md) and [`docs/`](docs/).
 
 ## Run the server
 
@@ -51,7 +51,12 @@ cargo run --bin sb -- push --vault ./notes ./notes/linear-algebra/vectors.md
 cargo run --bin sb -- curate
 
 # run a review session:
-#   shows each question, Enter reveals the answer, then rate 1–4 (again/hard/good/easy)
+#   Q&A cards: type your answer and press Enter — the LLM grades it, shows a
+#   verdict (Correct/Partial/Incorrect) and explanation, reveals the expected
+#   answer, and pre-highlights a suggested rating. Press Enter without typing
+#   to skip evaluation and just reveal the answer.
+#   Cloze cards: Enter reveals the filled text, then rate as usual.
+#   Rate 1–4 (again/hard/good/easy) to record the review.
 cargo run --bin sb -- review
 ```
 

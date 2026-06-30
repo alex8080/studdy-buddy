@@ -111,6 +111,11 @@ impl Repository for InMemoryRepository {
         inner.reviews.push(review.clone());
         Ok(())
     }
+
+    async fn get_card(&self, card: CardId) -> Result<Card> {
+        let inner = self.inner.lock().unwrap();
+        inner.cards.get(&card).cloned().ok_or(AppError::NotFound)
+    }
 }
 
 #[cfg(test)]
@@ -293,6 +298,24 @@ mod tests {
         let listed = repo.list_due(now).await.unwrap();
         assert_eq!(listed.len(), 1);
         assert_eq!(listed[0].id, due.id);
+    }
+
+    #[tokio::test]
+    async fn get_card_returns_saved_card() {
+        let repo = InMemoryRepository::new();
+        let card = qa_card("q", CardStatus::Pending);
+        repo.save_pending(std::slice::from_ref(&card))
+            .await
+            .unwrap();
+        let got = repo.get_card(card.id).await.unwrap();
+        assert_eq!(got.id, card.id);
+    }
+
+    #[tokio::test]
+    async fn get_card_returns_not_found_for_unknown_id() {
+        let repo = InMemoryRepository::new();
+        let err = repo.get_card(Uuid::new_v4()).await.unwrap_err();
+        assert!(matches!(err, AppError::NotFound));
     }
 
     #[tokio::test]

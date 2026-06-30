@@ -55,6 +55,15 @@ pub enum Rating {
     Easy,
 }
 
+/// Three-way verdict from free-text answer evaluation.
+#[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(rename_all = "lowercase")]
+pub enum Verdict {
+    Correct,
+    Partial,
+    Incorrect,
+}
+
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct Review {
     pub card_id: CardId,

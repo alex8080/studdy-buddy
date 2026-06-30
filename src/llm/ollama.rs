@@ -5,8 +5,8 @@ use serde::{Deserialize, Serialize};
 use serde_json::json;
 
 use super::prompt;
-use super::{ChunkContext, LlmError, LlmProvider, ProposedCard};
-use crate::model::CardContent;
+use super::{ChunkContext, EvaluationResult, LlmError, LlmProvider, ProposedCard};
+use crate::model::{Card, CardContent, Verdict};
 
 const REQUEST_TIMEOUT: Duration = Duration::from_secs(120);
 
@@ -22,6 +22,32 @@ impl OllamaProvider {
             .build()
             .expect("reqwest client build");
         Self { config, client }
+    }
+
+    async fn send_chat(&self, request: &ChatRequest<'_>) -> Result<ChatResponse, LlmError> {
+        let url = format!("{}/api/chat", self.config.base_url.trim_end_matches('/'));
+        let response = self
+            .client
+            .post(&url)
+            .json(request)
+            .send()
+            .await
+            .map_err(|e| LlmError::Transient {
+                reason: format!("ollama request failed: {e}"),
+                retry_after: None,
+            })?;
+
+        let status = response.status();
+        if !status.is_success() {
+            let body = response.text().await.unwrap_or_default();
+            return Err(LlmError::Config {
+                reason: format!("ollama returned {status}: {body}"),
+            });
+        }
+
+        response.json().await.map_err(|e| LlmError::BadInput {
+            reason: format!("ollama response parse failed: {e}"),
+        })
     }
 }
 
@@ -57,29 +83,7 @@ impl LlmProvider for OllamaProvider {
             },
         };
 
-        let url = format!("{}/api/chat", self.config.base_url.trim_end_matches('/'));
-        let response = self
-            .client
-            .post(&url)
-            .json(&request)
-            .send()
-            .await
-            .map_err(|e| LlmError::Transient {
-                reason: format!("ollama request failed: {e}"),
-                retry_after: None,
-            })?;
-
-        let status = response.status();
-        if !status.is_success() {
-            let body = response.text().await.unwrap_or_default();
-            return Err(LlmError::Config {
-                reason: format!("ollama returned {status}: {body}"),
-            });
-        }
-
-        let chat: ChatResponse = response.json().await.map_err(|e| LlmError::BadInput {
-            reason: format!("ollama response parse failed: {e}"),
-        })?;
+        let chat = self.send_chat(&request).await?;
 
         let payload: CardsPayload =
             serde_json::from_str(&chat.message.content).map_err(|e| LlmError::BadInput {
@@ -98,6 +102,73 @@ impl LlmProvider for OllamaProvider {
             })
             .collect())
     }
+
+    async fn evaluate_answer(
+        &self,
+        card: &Card,
+        user_answer: &str,
+    ) -> Result<EvaluationResult, LlmError> {
+        let (front, back) = match &card.content {
+            CardContent::Qa { front, back } => (front.as_str(), back.as_str()),
+            CardContent::Cloze { .. } => {
+                return Err(LlmError::BadInput {
+                    reason: "evaluate_answer is not supported for cloze cards".to_string(),
+                });
+            }
+        };
+
+        let user = prompt::render_evaluate_user(front, back, user_answer);
+        let request = ChatRequest {
+            model: &self.config.model,
+            messages: vec![
+                Message {
+                    role: "system",
+                    content: prompt::EVALUATE_SYSTEM_PROMPT,
+                },
+                Message {
+                    role: "user",
+                    content: &user,
+                },
+            ],
+            stream: false,
+            format: evaluate_schema(),
+            options: ChatOptions {
+                temperature: self.config.temperature,
+                num_predict: self.config.num_predict,
+            },
+        };
+
+        let chat = self.send_chat(&request).await?;
+
+        let payload: EvaluationPayload =
+            serde_json::from_str(&chat.message.content).map_err(|e| LlmError::BadInput {
+                reason: format!("ollama content parse failed: {e}"),
+            })?;
+
+        let verdict = match payload.verdict.as_str() {
+            "correct" => Verdict::Correct,
+            "partial" => Verdict::Partial,
+            _ => Verdict::Incorrect,
+        };
+        Ok(EvaluationResult {
+            verdict,
+            explanation: payload.explanation,
+        })
+    }
+}
+
+fn evaluate_schema() -> serde_json::Value {
+    json!({
+        "type": "object",
+        "properties": {
+            "verdict": {
+                "type": "string",
+                "enum": ["correct", "partial", "incorrect"]
+            },
+            "explanation": {"type": "string"}
+        },
+        "required": ["verdict", "explanation"]
+    })
 }
 
 fn response_schema() -> serde_json::Value {
@@ -174,9 +245,17 @@ struct CardJson {
     rationale: Option<String>,
 }
 
+#[derive(Deserialize)]
+struct EvaluationPayload {
+    verdict: String,
+    explanation: String,
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
+    use chrono::Utc;
+    use uuid::Uuid;
     use wiremock::matchers::{method, path};
     use wiremock::{Mock, MockServer, ResponseTemplate};
 
@@ -276,5 +355,115 @@ mod tests {
             .await
             .unwrap_err();
         assert!(matches!(err, LlmError::Config { .. }), "got {err:?}");
+    }
+
+    fn qa_card(front: &str, back: &str) -> Card {
+        use crate::model::CardStatus;
+        Card {
+            id: Uuid::new_v4(),
+            content: CardContent::Qa {
+                front: front.into(),
+                back: back.into(),
+            },
+            source_file: "n.md".into(),
+            source_heading: None,
+            tags: vec![],
+            status: CardStatus::Accepted,
+            created_at: Utc::now(),
+        }
+    }
+
+    fn cloze_card() -> Card {
+        use crate::model::CardStatus;
+        Card {
+            id: Uuid::new_v4(),
+            content: CardContent::Cloze {
+                text: "The capital of France is {{Paris}}.".into(),
+                spans: vec![],
+            },
+            source_file: "n.md".into(),
+            source_heading: None,
+            tags: vec![],
+            status: CardStatus::Accepted,
+            created_at: Utc::now(),
+        }
+    }
+
+    // Note: these tests verify HTTP plumbing and JSON parsing only.
+    // Prompt quality (anchoring to expected answer, accepting paraphrases)
+    // requires a live Ollama instance; see tests/llm_ollama.rs for that gate.
+
+    #[tokio::test]
+    async fn evaluate_answer_parses_correct_verdict() {
+        let server = MockServer::start().await;
+        mount_chat_response(
+            &server,
+            200,
+            envelope(r#"{"verdict":"correct","explanation":"Matches expected answer."}"#),
+        )
+        .await;
+
+        let result = provider_for(&server)
+            .evaluate_answer(&qa_card("What is 2+2?", "4"), "4")
+            .await
+            .expect("ok");
+        assert_eq!(result.verdict, Verdict::Correct);
+        assert_eq!(result.explanation, "Matches expected answer.");
+    }
+
+    #[tokio::test]
+    async fn evaluate_answer_parses_incorrect_verdict() {
+        let server = MockServer::start().await;
+        mount_chat_response(
+            &server,
+            200,
+            envelope(r#"{"verdict":"incorrect","explanation":"Wrong answer."}"#),
+        )
+        .await;
+
+        let result = provider_for(&server)
+            .evaluate_answer(&qa_card("What is 2+2?", "4"), "5")
+            .await
+            .expect("ok");
+        assert_eq!(result.verdict, Verdict::Incorrect);
+    }
+
+    #[tokio::test]
+    async fn evaluate_answer_malformed_content_is_bad_input() {
+        let server = MockServer::start().await;
+        mount_chat_response(&server, 200, envelope("not json")).await;
+
+        let err = provider_for(&server)
+            .evaluate_answer(&qa_card("Q", "A"), "answer")
+            .await
+            .unwrap_err();
+        assert!(matches!(err, LlmError::BadInput { .. }), "got {err:?}");
+    }
+
+    #[tokio::test]
+    async fn evaluate_answer_non_2xx_is_config() {
+        let server = MockServer::start().await;
+        Mock::given(method("POST"))
+            .and(path("/api/chat"))
+            .respond_with(ResponseTemplate::new(503).set_body_string("unavailable"))
+            .mount(&server)
+            .await;
+
+        let err = provider_for(&server)
+            .evaluate_answer(&qa_card("Q", "A"), "answer")
+            .await
+            .unwrap_err();
+        assert!(matches!(err, LlmError::Config { .. }), "got {err:?}");
+    }
+
+    #[tokio::test]
+    async fn evaluate_answer_cloze_card_is_bad_input_without_http_call() {
+        let server = MockServer::start().await;
+        // No mock mounted — any HTTP call would panic.
+        let err = provider_for(&server)
+            .evaluate_answer(&cloze_card(), "Paris")
+            .await
+            .unwrap_err();
+        assert!(matches!(err, LlmError::BadInput { .. }), "got {err:?}");
     }
 }

@@ -170,6 +170,26 @@ async fn update_content_persists_and_guards_non_pending() {
 }
 
 #[tokio::test]
+async fn get_card_returns_card_when_present() {
+    let dir = TempDir::new().unwrap();
+    let repo = FileRepository::new(dir.path());
+    let card = qa_card("c.md", "q", CardStatus::Pending);
+    repo.save_pending(std::slice::from_ref(&card))
+        .await
+        .unwrap();
+    let got = repo.get_card(card.id).await.unwrap();
+    assert_eq!(got.id, card.id);
+}
+
+#[tokio::test]
+async fn get_card_returns_not_found_for_unknown_id() {
+    let dir = TempDir::new().unwrap();
+    let repo = FileRepository::new(dir.path());
+    let err = repo.get_card(Uuid::new_v4()).await.unwrap_err();
+    assert!(matches!(err, studybuddy::error::AppError::NotFound));
+}
+
+#[tokio::test]
 async fn reviews_append_to_log() {
     let dir = TempDir::new().unwrap();
     let repo = FileRepository::new(dir.path());
