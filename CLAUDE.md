@@ -89,7 +89,7 @@ Per-card leaf anchoring within a merged chunk is **out of scope for ingest** —
 
 ## Auth
 
-- Bearer token: `[server] api_token = "..."` in `studybuddy.toml` or `STUDYBUDDY_API_TOKEN` env var.
+- Bearer token: `[server] api_token = "..."` in `studybuddy.toml` or `PUBLIC_STUDYBUDDY_API_TOKEN` env var.
 - `GET /health` is intentionally unprotected (reverse-proxy health checks); all other routes require the token when one is configured.
 - Token comparison uses SHA-256 digests (timing-safe, no new dep — `sha2` already present).
 - Token validated at CLI startup via `client::validate_api_token()`, not deep in the client.
@@ -97,7 +97,7 @@ Per-card leaf anchoring within a merged chunk is **out of scope for ingest** —
 
 ## Load-bearing constraints (don't violate without re-opening the design)
 
-- **Self-hosted local only in v1.** No SaaS, no multi-user concerns. Bearer-token auth exists for remote access (`[server] api_token` / `STUDYBUDDY_API_TOKEN`).
+- **Self-hosted local only in v1.** No SaaS, no multi-user concerns. Bearer-token auth exists for remote access (`[server] api_token` / `PUBLIC_STUDYBUDDY_API_TOKEN`).
 - **Source of truth is the user's markdown.** No web augmentation in v1 — the LLM works from notes only.
 - **Cards keep a `(source_file, source_heading)` anchor.** Cheap to add now, painful to retrofit. Every card type must carry it.
 - **SRS lives behind a `Scheduler` trait.** SM-2 is the v1 implementation; FSRS swaps in later via `fsrs-rs`. Do not let SM-2-specific state leak into the rest of the code.

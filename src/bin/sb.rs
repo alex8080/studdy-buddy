@@ -29,7 +29,7 @@ struct Cli {
     server: String,
 
     /// Bearer token for server authentication.
-    #[arg(long, global = true, env = "STUDYBUDDY_API_TOKEN")]
+    #[arg(long, global = true, env = "PUBLIC_STUDYBUDDY_API_TOKEN")]
     api_token: Option<String>,
 
     #[command(subcommand)]

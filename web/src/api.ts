@@ -1,6 +1,6 @@
 import type { Card, Rating } from './types'
 
-const token = import.meta.env.STUDYBUDDY_API_TOKEN as string | undefined
+const token = import.meta.env.PUBLIC_STUDYBUDDY_API_TOKEN as string | undefined
 
 function authHeaders(): Record<string, string> {
   return token ? { Authorization: `Bearer ${token}` } : {}

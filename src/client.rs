@@ -198,7 +198,7 @@ async fn error_from(status: StatusCode, resp: Response) -> anyhow::Error {
 pub fn validate_api_token(token: &str) -> anyhow::Result<()> {
     anyhow::ensure!(
         token.is_ascii(),
-        "STUDYBUDDY_API_TOKEN must contain only ASCII characters"
+        "PUBLIC_STUDYBUDDY_API_TOKEN must contain only ASCII characters"
     );
     Ok(())
 }

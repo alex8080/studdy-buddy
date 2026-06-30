@@ -4,6 +4,9 @@
 
 [server]
 bind = "127.0.0.1:8080"
+# api_token = ""   # Bearer token required by all clients (CLI, watcher, web frontend).
+                   # Set here or via PUBLIC_STUDYBUDDY_API_TOKEN env var.
+                   # Required when the frontend and backend run on different machines.
 
 [store]
 data_dir = "./studybuddy-data"

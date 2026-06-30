@@ -8,7 +8,7 @@ function bypassHtml(req: IncomingMessage) {
 
 export default defineConfig({
   plugins: [react()],
-  envPrefix: 'STUDYBUDDY_',
+  envPrefix: 'PUBLIC_STUDYBUDDY_',
   server: {
     proxy: {
       '^/(health|ingest|cards|reviews)': { target: 'http://localhost:8080', bypass: bypassHtml },
